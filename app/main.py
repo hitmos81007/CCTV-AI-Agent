@@ -122,7 +122,7 @@ def _video_runtime_status() -> dict[str, Any]:
     """Report optional video stack readiness without importing YOLO or loading weights."""
     modules = {"torch": "torch", "opencv": "cv2", "ultralytics": "ultralytics"}
     missing = [label for label, module in modules.items() if importlib.util.find_spec(module) is None]
-    configured_device = os.getenv("YOLO_DEVICE", "0")
+    configured_device = os.getenv("YOLO_DEVICE", "auto")
     result: dict[str, Any] = {
         "missing_modules": missing,
         "configured_device": configured_device,

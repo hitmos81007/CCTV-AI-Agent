@@ -11,6 +11,14 @@ from fastapi.testclient import TestClient
 from app import db
 from app.main import _video_runtime_status, app
 from app.schemas import VehicleClue
+from app.video_analysis import _resolve_device
+
+
+class VideoDeviceSelectionTests(unittest.TestCase):
+    def test_auto_uses_gpu_when_available_and_cpu_otherwise(self):
+        self.assertEqual(_resolve_device("auto", cuda_available=True), 0)
+        self.assertEqual(_resolve_device("auto", cuda_available=False), "cpu")
+        self.assertEqual(_resolve_device("cpu", cuda_available=True), "cpu")
 
 
 class BackendContractTests(unittest.TestCase):

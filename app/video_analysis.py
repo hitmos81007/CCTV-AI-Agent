@@ -9,6 +9,18 @@ from typing import Any
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 
+def _resolve_device(configured: str | None = None, cuda_available: bool | None = None) -> int | str:
+    """Use CUDA when available by default; allow an explicit CPU/GPU override."""
+    requested = (configured if configured is not None else os.getenv("YOLO_DEVICE", "auto")).strip()
+    if requested.casefold() in {"", "auto"}:
+        if cuda_available is None:
+            import torch
+
+            cuda_available = bool(torch.cuda.is_available())
+        return 0 if cuda_available else "cpu"
+    return int(requested) if requested.isdigit() else requested
+
+
 @lru_cache(maxsize=1)
 def _model() -> Any:
     from ultralytics import YOLO
@@ -59,7 +71,7 @@ def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0
     capture.release()
 
     model = _model()
-    device = os.getenv("YOLO_DEVICE", "0")
+    device = _resolve_device()
     tracks: dict[str, dict[str, Any]] = {}
     for frame_index, result in enumerate(
         model.track(source=path, stream=True, tracker="bytetrack.yaml", device=device, conf=confidence, verbose=False)
