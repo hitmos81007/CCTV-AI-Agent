@@ -1,0 +1,59 @@
+# CCTV Investigation Agent — local demo
+
+This project is a local, human-reviewed evidence workflow. It supports vehicle-only clue comparison and tracking. It does not perform facial identification, person tracking, or license-plate recognition, and it does not decide guilt or enforcement outcomes. Use only synthetic or public footage.
+
+## Verified state
+
+| Component | Current state |
+|---|---|
+| Authenticated case intake form | The saved n8n draft includes an `n8n User Auth` form for case ID, description, initial jurisdiction, and an adjacency-map JSON string. `Validate Case Intake` checks the fields, parses the map, requires two distinct neighbors for the three-zone review, and passes the normalized payload into the existing FastAPI intake path. A synthetic, pinned form payload executed through this validator successfully; the temporary test payload was unpinned afterward. The browser form submission itself remains unverified because its test URL redirected to an OAuth consent screen. |
+| Current Ollama reachability (2026-11-22) | Host `http://localhost:11434/api/tags` returned HTTP 200 and listed `llama3.2:latest`. A read-only request from the `cctv-n8n` container to `host.docker.internal:11434/api/tags` also returned HTTP 200. |
+| n8n case intake and local Ollama parsing | On 2026-11-22, the saved draft completed a live run through `POST /api/v1/investigations/start` over `host.docker.internal`; FastAPI returned HTTP 201 and persisted the normalized `llama3.2:latest` clue for synthetic case `DEMO-001` (white sedan, 10:15, missing zone stored as null). A fresh execution from the n8n manual trigger also displayed `Workflow executed successfully`; the isolated API database confirms the persisted clue, zero sightings, zero follow-ups, and valid integrity. The workflow and status note were reopened to confirm they persisted. |
+| Live Docker-to-Windows check (2026-11-22) | A refreshed FastAPI instance on an isolated database returned HTTP 200 to the n8n container for `/health` and `/api/v1/integrity`. The health response reported Ollama ready, `torch`/OpenCV/Ultralytics missing, CUDA unknown, and GPU inference not ready. A full n8n run then returned successfully through the three-zone no-video guard; the test service was stopped afterward. |
+| Three jurisdiction workers | Planner reads the case `neighbors` map; the review queue ran with 3 items and carried the parsed clue plus each zone's neighboring zones. |
+| Video-to-zone handoff | Case intake now returns locally registered videos; the queue matches them by jurisdiction and emits one worker item per clip. With no registered clips, it emits one waiting item per zone. The Code node was step-tested on the zero-video case; a real uploaded-video assignment is not yet tested. |
+| No-video and jurisdiction guards | The n8n Switch requires `video_source_id`; API uploads and analysis also validate jurisdictions against the case adjacency map. A contract test verifies an undeclared zone is rejected before video lookup. The latest full manual run stopped at the no-video guard; the zone-analysis endpoint was not called. |
+| Follow-up polling | Five-minute Schedule Trigger → ready-jobs GET → Split Out → POST using the returned `analysis_url` is saved in the draft. The URL expression was corrected on 2026-11-22. The isolated test had no real ready jobs (`count: 0`), so the follow-up analysis POST remains untested. |
+| FastAPI and local Ollama | Core API starts on Windows, health reports Ollama ready, and `llama3.2:latest` parsed and persisted a synthetic white sedan / 10:15 clue. |
+| Persistence and integrity | The isolated live-run database contains the synthetic `DEMO-001` case and parsed clue, zero sightings, no follow-ups, and two audit entries. `GET /api/v1/integrity` returned `valid: true` for the audit chain and evidence files. The successful n8n run stopped at the no-video guard; no `/api/v1/zone/analyze` call was made and no sightings were fabricated. |
+| Contract tests | 16 tests pass in the project-local `work/venv` (rerun 2026-11-22), including normalization of Ollama's literal `"null"` fields, rejection of invalid clue output without persisting clues, truthful reporting of missing video/GPU dependencies through `/health`, and rejection of out-of-map jurisdictions before analysis. Starlette emits a deprecation warning about its current `httpx` test client. |
+| Human review interface | The backend serves the local review page (HTTP 200). There are no sightings in the test database, so a real review decision has not been exercised. |
+| CPU video smoke test (2026-11-22) | In a separate short-path environment, PyTorch `2.14.1+cpu`, torchvision `0.29.1+cpu`, OpenCV `5.1.0`, and Ultralytics `8.4.216` were installed. OpenCV read frames from both supplied MP4s (3840×2160 at 29.97 fps, 869 frames; 2560×1440 at 29.97 fps, 452 frames). YOLO11n + ByteTrack completed CPU runs in 149.4 s and 65.5 s, emitting 56 and 126 candidate vehicle tracks. These are unreviewed model tracks, not confirmed unique vehicles or evidence sightings; no case, camera, jurisdiction, or recording start time was assigned. The clips remained in Downloads and were not copied into the project. |
+| RTX 5050 GPU inference | Hardware is an RTX 5050 Laptop GPU with about 8 GiB VRAM; driver `573.13` reports CUDA `12.8`. The tested PyTorch environment is CPU-only (`torch.cuda.is_available() == false`); CUDA inference is not yet installed or tested. |
+
+The n8n workflow remains an unpublished draft. `n8n/CCTV-Investigation-Orchestrator.json` was refreshed from n8n's saved export after the form branch was connected; it contains 14 nodes, both intake paths, and no pinned test data. The earlier failed smoke runs exposed a direct connection that bypassed the video-ID guard; that connection was removed. The latest full live run verified the three-item waiting queue and stopped safely at the guard; it made no `/api/v1/zone/analyze` call and created no detections. Isolated smoke databases are under `work/`; the normal application database is under `data/`.
+
+## Windows and Docker setup
+
+Run FastAPI on Windows so it can reach Ollama at `127.0.0.1:11434` and save evidence locally. The n8n Docker container reaches the host API through `host.docker.internal`.
+
+1. This project environment uses 64-bit Python 3.15. PyTorch 2.15 supports Python 3.11–3.15, and its release notes list Windows CUDA 13.2/13.4 wheels. Choose the matching Windows CUDA wheel from the official install guidance; the GPU path is not installed or tested yet. [PyTorch 2.15 release notes](https://pytorch.org/blog/pytorch-2-15-release-blog/) · [PyTorch install selector](https://pytorch.org/get-started/locally/)
+2. Start Ollama and confirm the desired model appears in `ollama list`. This machine reported `llama3.2:latest`.
+3. In PowerShell, go to this folder and run `./run_backend.ps1`. It creates `.venv`, copies `.env.example` to `.env` if needed, installs the core API requirements, and starts FastAPI on port 8000.
+4. Verify `http://localhost:8000/health`; its `video_runtime` section distinguishes missing video packages from CUDA-ready GPU inference. Open `http://localhost:8000/` for the local review page.
+5. For GPU video processing, install the CUDA-enabled PyTorch build into the same `.venv` using the official selector, then install `requirements-video.txt`. Verify `torch.cuda.is_available()` and the GPU name before setting `YOLO_DEVICE=0`.
+
+The API binds to `0.0.0.0` so Docker can use `host.docker.internal`. Keep port 8000 limited to the host/Docker network; do not expose it to the public internet. Evidence clips are stored under `data/evidence`, and SQLite is stored under `data/` by default.
+
+## API workflow
+
+1. n8n sends the case ID, description, initial zone, and adjacency map to `POST /api/v1/investigations/start`. The API creates or reuses the case, asks local Ollama to extract vehicle traits/time text, and returns the clue plus locally registered video metadata. It does not return detections.
+2. The planner fans out the initial zone and up to two adjacent zones. The queue matches returned clips by case and jurisdiction, emitting one worker item per clip. If a case has no registered clip, it emits a waiting item with a null video ID and the guard blocks analysis.
+3. Upload each synthetic/public clip with multipart fields `case_id`, `jurisdiction`, `camera_id`, `recorded_at`, and `file` to `POST /api/v1/videos`. Intake stores the original locally and returns its `video_source_id` and SHA-256. If n8n created the case first, run the same case through n8n again after upload so intake refreshes the worker assignments.
+4. The API checks case/zone consistency and only then runs vehicle-class YOLO tracking on each registered clip.
+5. Actual tracked candidates are stored with clip timestamp, offset, camera, confidence, and a derived evidence hash tied to the source clip hash. The clue score compares broad vehicle color/type traits; it is not an identity score.
+6. If an actual candidate reaches the configured threshold, the API creates follow-up jobs for adjacent zones and searches only already-registered local clips whose times overlap the follow-up window. Jobs without clips remain `awaiting_video`; a matching later upload can make a job ready. n8n polls `GET /api/v1/followups/ready` and dispatches only those jobs to `POST /api/v1/followups/{id}/analyze`. No camera search is implied.
+7. A human reviews actual clip segments in the local review page and records `confirmed_candidate`, `not_relevant`, or `needs_more_review`. These are review labels, not enforcement or guilt findings.
+
+`GET /api/v1/integrity` recomputes stored clip hashes and derived sighting hashes, and validates the hash-chained SQLite audit log.
+
+## Verification and remaining setup
+
+Run from this directory after installing the core requirements:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The 16 contract tests cover case persistence and mocked clue parsing, Ollama-unavailable and invalid-output behavior without fabricated or persisted clues, literal-null normalization, truthful optional video/GPU readiness through `/health`, jurisdiction-map guards, missing/unregistered video rejection, audit-chain validation and tamper detection, empty follow-up dispatch, and work-item resolution when no clips are available. Separately, the real local Ollama model was called through n8n's Docker-to-host API path; the manual workflow completed through its three-worker queue and no-video guard. The final run created no sightings. A real CPU YOLO11n + ByteTrack smoke test has now completed against both supplied MP4s and emitted unreviewed candidate tracks (56 and 126). No video was uploaded through the FastAPI API or assigned to a case/camera/jurisdiction, and no GPU inference, follow-up-analysis POST, or human review decision has been tested yet.
+

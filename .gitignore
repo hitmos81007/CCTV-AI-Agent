@@ -1,0 +1,17 @@
+.env
+.venv/
+venv/
+video-venv/
+work/
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.mp4
+*.pt
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+uploads/
+evidence/
