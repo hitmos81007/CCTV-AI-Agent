@@ -146,6 +146,10 @@ class BackendContractTests(unittest.TestCase):
         self.assertIn('id="run-search"', response.text)
         self.assertIn('/api/v1/zones/analyze', response.text)
         self.assertIn("Transcribe locally", response.text)
+        self.assertIn('id="progress-fill"', response.text)
+        self.assertIn("function setStage(stage)", response.text)
+        self.assertIn('.zone-card[data-zone="North"]', response.text)
+        self.assertIn('row.dataset.state=result.status', response.text)
 
     def test_voice_clue_transcription_uses_local_transcriber_and_deletes_temporary_audio(self):
         transcriber = Mock()
