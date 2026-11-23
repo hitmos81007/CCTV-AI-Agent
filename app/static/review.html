@@ -3,62 +3,271 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>CCTV Evidence Review</title>
+  <meta name="theme-color" content="#f4f7fa">
+  <title>CCTV Case Search &amp; Review</title>
   <style>
-    :root { color-scheme: dark; --bg:#101820; --panel:#18232d; --line:#2c3a46; --text:#e8eef3; --muted:#a8b6c2; --accent:#79c0a4; --warn:#e4c178; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,Segoe UI,sans-serif; }
-    main { max-width:1180px; margin:auto; padding:32px 20px 64px; } header { display:flex; justify-content:space-between; align-items:end; gap:20px; margin-bottom:24px; }
-    h1 { margin:0; font-size:28px; } h2 { margin:0 0 14px; font-size:18px; } p { color:var(--muted); margin:6px 0; }
-    .badge { border:1px solid #806f44; background:#342d1c; color:#f3d791; border-radius:999px; padding:4px 10px; font-size:12px; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; margin:18px 0; }
-    .controls { display:flex; gap:10px; align-items:center; } input,select,button { border:1px solid var(--line); border-radius:8px; color:var(--text); background:#111a22; padding:9px 11px; font:inherit; }
-    button { cursor:pointer; } button:hover { border-color:var(--accent); } .primary { background:#1e4237; border-color:#39745f; } .quiet { background:transparent; }
-    .grid { display:grid; grid-template-columns:1.2fr 1fr; gap:18px; } .meta { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 16px; margin:12px 0; }
-    .meta div { color:var(--muted); overflow-wrap:anywhere; } .meta strong { color:var(--text); font-weight:600; }
-    video { width:100%; max-height:350px; background:#06090c; border-radius:10px; } .hash { font:12px ui-monospace,monospace; color:#b9c8d4; overflow-wrap:anywhere; }
-    .review { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; } .empty { border:1px dashed var(--line); padding:24px; color:var(--muted); border-radius:10px; }
-    @media(max-width:780px){header{align-items:start;flex-direction:column}.grid{grid-template-columns:1fr}.meta{grid-template-columns:1fr}}
+    :root { color-scheme:light; --ink:#142a3a; --muted:#536779; --line:#d5dee7; --paper:#fff; --wash:#f4f7fa; --blue:#1d527a; --blue-strong:#164263; --teal:#12695e; --green-bg:#eaf5f1; --amber:#835914; --amber-bg:#fff7e6; --red:#9b3434; --shadow:0 8px 24px rgba(20,42,58,.07); }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--wash); color:var(--ink); font:16px/1.55 system-ui,"Segoe UI",sans-serif; }
+    main { max-width:1180px; margin:auto; padding:28px 22px 64px; }
+    h1,h2,h3,p { margin-top:0; } h1 { margin-bottom:5px; font-size:clamp(26px,4vw,36px); line-height:1.2; letter-spacing:-.02em; } h2 { margin-bottom:6px; font-size:21px; } h3 { margin:0; font-size:17px; } p { margin-bottom:10px; color:var(--muted); }
+    .top { display:flex; align-items:flex-start; justify-content:space-between; gap:20px; margin-bottom:22px; }
+    .eyebrow { margin:0 0 5px; color:var(--blue); font-size:12px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; }
+    .trust { border:1px solid #b7d5ce; background:var(--green-bg); color:#155649; border-radius:999px; padding:8px 13px; font-size:13px; font-weight:700; white-space:nowrap; }
+    .steps { display:grid; grid-template-columns:repeat(4,1fr); gap:9px; margin:20px 0; }
+    .step { display:flex; align-items:center; gap:10px; min-height:54px; padding:10px 13px; border:1px solid var(--line); border-radius:10px; background:#fff; color:var(--muted); font-weight:700; }
+    .step-num { display:grid; place-items:center; width:27px; height:27px; flex:none; border-radius:50%; background:#e9eef3; color:var(--blue); font-size:13px; }
+    .panel { margin:15px 0; padding:22px; border:1px solid var(--line); border-radius:15px; background:var(--paper); box-shadow:var(--shadow); }
+    .panel-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:14px; }
+    .sub { max-width:780px; margin:5px 0 0; font-size:14px; }
+    .step-tag { flex:none; color:var(--blue); font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:.06em; }
+    label { display:grid; gap:5px; color:var(--ink); font-size:14px; font-weight:700; }
+    input,select,textarea,button { font:inherit; }
+    input,select,textarea { width:100%; min-height:44px; padding:10px 12px; border:1px solid #aebdca; border-radius:8px; background:#fff; color:var(--ink); }
+    textarea { min-height:108px; resize:vertical; }
+    input:focus,select:focus,textarea:focus,button:focus-visible { outline:3px solid #94c8e7; outline-offset:2px; }
+    .form-grid { display:grid; grid-template-columns:minmax(220px,.8fr) minmax(220px,.7fr) 2fr; gap:14px; align-items:start; }
+    .field-note { margin:5px 0 0; font-size:12px; font-weight:400; color:var(--muted); }
+    .button-row { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:15px; }
+    button { min-height:43px; padding:9px 15px; border:1px solid #aebdca; border-radius:8px; background:#fff; color:var(--ink); cursor:pointer; font-weight:750; }
+    button:hover:not(:disabled) { border-color:var(--blue); background:#f1f7fb; }
+    button:disabled { cursor:not-allowed; opacity:.55; }
+    .primary { border-color:var(--blue); background:var(--blue); color:#fff; }
+    .primary:hover:not(:disabled) { background:var(--blue-strong); color:#fff; }
+    .secondary { border-color:#8bbab0; color:#125b51; background:#f3faf8; }
+    .status { min-height:24px; margin:8px 0 0; color:var(--muted); font-size:14px; }
+    .callout { margin-top:14px; padding:12px 14px; border-left:4px solid #c39542; border-radius:6px; background:var(--amber-bg); color:#674a16; font-size:13px; }
+    .case-summary { display:none; margin-top:14px; padding:14px; border:1px solid #b7d5ce; border-radius:10px; background:var(--green-bg); }
+    .case-summary.visible { display:block; }
+    .case-summary strong { color:#155649; }
+    .audio-tools { display:grid; grid-template-columns:minmax(220px,1fr) auto auto; gap:10px; align-items:end; margin-top:14px; padding-top:14px; border-top:1px solid #e4eaf0; }
+    .zone-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:13px; }
+    .zone-card { display:grid; gap:11px; padding:16px; border:1px solid var(--line); border-radius:11px; background:#fcfdfe; }
+    .zone-title { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .zone-direction { border-radius:6px; background:#eaf0f5; color:var(--blue); padding:3px 8px; font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }
+    .zone-card label { font-size:13px; }
+    .zone-card input { min-height:40px; }
+    .zone-state { min-height:20px; margin:0; font-size:12px; color:var(--teal); overflow-wrap:anywhere; }
+    .search-result-list { display:grid; gap:8px; margin-top:12px; }
+    .search-result { display:flex; justify-content:space-between; gap:12px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:#fbfcfd; }
+    .result-state { color:var(--muted); font-size:13px; text-align:right; }
+    .summary-good { color:#155649; font-weight:700; }
+    .summary-wait { color:var(--amber); font-weight:700; }
+    .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+    .toolbar input { max-width:320px; }
+    .record-count { color:var(--muted); font-size:14px; }
+    .empty { padding:22px; border:1px dashed #b8c5d0; border-radius:10px; color:var(--muted); background:#fbfcfd; }
+    .record { padding:18px; border:1px solid var(--line); border-radius:12px; background:var(--paper); box-shadow:var(--shadow); }
+    .record + .record { margin-top:14px; }
+    .record-title { margin:0 0 12px; font-size:19px; }
+    .record-grid { display:grid; grid-template-columns:minmax(280px,1fr) minmax(300px,1.1fr); gap:18px; align-items:start; }
+    video { width:100%; max-height:370px; border-radius:9px; background:#101820; }
+    .record-meta { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 12px; margin:10px 0 14px; }
+    .record-meta div { overflow-wrap:anywhere; color:var(--muted); font-size:13px; }
+    .record-meta strong { color:var(--ink); }
+    .hash { color:#44596b; font:12px/1.45 ui-monospace,Consolas,monospace; overflow-wrap:anywhere; }
+    .review-fields { display:grid; grid-template-columns:1fr 1.4fr; gap:8px; margin-top:12px; }
+    .review-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .quiet { background:#f8fafc; }
+    @media(max-width:820px){main{padding:20px 14px 44px}.top{flex-direction:column}.trust{white-space:normal}.steps{grid-template-columns:repeat(2,1fr)}.form-grid{grid-template-columns:1fr 1fr}.form-grid label:last-child{grid-column:1/-1}.audio-tools{grid-template-columns:1fr 1fr}.audio-tools label{grid-column:1/-1}.record-grid{grid-template-columns:1fr}}
+    @media(max-width:560px){.panel{padding:17px}.steps{gap:7px}.step{font-size:13px;padding:8px}.form-grid,.zone-grid,.audio-tools,.record-meta,.review-fields{grid-template-columns:1fr}.form-grid label:last-child{grid-column:auto}.search-result{flex-direction:column}.result-state{text-align:left}}
   </style>
 </head>
 <body>
 <main>
-  <header><div><h1>Evidence review</h1><p>Review actual vehicle tracks from uploaded footage. Findings remain pending until a reviewer records a decision.</p></div><span class="badge">Human review required · No facial identification</span></header>
-  <section class="panel">
-    <div class="controls"><label for="case">Case filter</label><input id="case" placeholder="All cases"><button id="refresh" class="primary">Refresh</button><span id="count" aria-live="polite"></span></div>
+  <header class="top">
+    <div><p class="eyebrow">Local investigation workspace</p><h1>Case search &amp; evidence review</h1><p>Describe what investigators are looking for, add camera clips by direction, and review real video candidates.</p></div>
+    <span class="trust">Local video processing · Human decision required</span>
+  </header>
+  <nav class="steps" aria-label="Case search steps">
+    <div class="step"><span class="step-num">1</span> Create case</div><div class="step"><span class="step-num">2</span> Add camera feeds</div><div class="step"><span class="step-num">3</span> Search clips</div><div class="step"><span class="step-num">4</span> Review candidates</div>
+  </nav>
+  <p id="workflow-status" class="status" role="status" aria-live="polite">Ready to start a local case.</p>
+
+  <section class="panel" aria-labelledby="case-title">
+    <div class="panel-head"><div><h2 id="case-title">Describe the case clue</h2><p class="sub">Use ordinary wording, including approximate time and place. Mention visible clothes, colors, carried items, vehicle type, or suspected marks for human review.</p></div><span class="step-tag">Step 1</span></div>
+    <div class="form-grid">
+      <label>Case ID<input id="case-id" maxlength="80" placeholder="e.g. DEMO-2026-01" autocomplete="off"><span class="field-note">Use your local case reference.</span></label>
+      <label>Starting direction<select id="initial-zone"><option>North</option><option>West</option><option>South</option><option>East</option></select><span class="field-note">The first area to prioritize.</span></label>
+      <label>What should the search look for?<textarea id="case-description" maxlength="4000" placeholder="Example: a person in a navy jacket carrying a red backpack near the north gate around 10:15."></textarea></label>
+    </div>
+    <div class="button-row"><button id="create-case" class="primary">Create case &amp; parse clue locally</button><span id="case-status" class="status" role="status" aria-live="polite"></span></div>
+    <div id="case-summary" class="case-summary" aria-live="polite"></div>
+    <div class="audio-tools">
+      <label>Or choose an audio recording<input id="clue-audio" type="file" accept="audio/*,.m4a,.wav,.mp3,.webm,.flac"><span class="field-note">Local transcription only; the audio is deleted after transcription.</span></label>
+      <button id="transcribe-clue" class="quiet">Transcribe locally</button>
+      <button id="use-transcript" class="secondary">Use transcript as clue</button>
+    </div>
+    <p id="transcript-status" class="status" role="status" aria-live="polite"></p>
+    <div class="callout">Search returns possible visual matches for a person to review. It does not identify a person or verify a scar, tattoo, face, or license plate.</div>
   </section>
-  <section id="items" aria-live="polite"></section>
+
+  <section id="feeds-panel" class="panel" aria-labelledby="feeds-title">
+    <div class="panel-head"><div><h2 id="feeds-title">Add camera footage</h2><p class="sub">Upload synthetic or public clips. For each clip, enter its camera ID and the recording start time shown by that camera. Files are stored on this computer.</p></div><span class="step-tag">Step 2</span></div>
+    <p id="active-case-label" class="status">Create a case to enable feed upload.</p>
+    <div class="zone-grid">
+      <div class="zone-card" data-zone="North"><div class="zone-title"><h3>North</h3><span class="zone-direction">Direction</span></div><label>Camera ID<input class="camera-id" maxlength="80" placeholder="e.g. CAM-N-01"></label><label>Recording date and time<input class="recorded-at" type="datetime-local"></label><label>Video clip<input class="clip-file" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,.m4v"></label><p class="zone-state" aria-live="polite"></p></div>
+      <div class="zone-card" data-zone="West"><div class="zone-title"><h3>West</h3><span class="zone-direction">Direction</span></div><label>Camera ID<input class="camera-id" maxlength="80" placeholder="e.g. CAM-W-01"></label><label>Recording date and time<input class="recorded-at" type="datetime-local"></label><label>Video clip<input class="clip-file" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,.m4v"></label><p class="zone-state" aria-live="polite"></p></div>
+      <div class="zone-card" data-zone="South"><div class="zone-title"><h3>South</h3><span class="zone-direction">Direction</span></div><label>Camera ID<input class="camera-id" maxlength="80" placeholder="e.g. CAM-S-01"></label><label>Recording date and time<input class="recorded-at" type="datetime-local"></label><label>Video clip<input class="clip-file" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,.m4v"></label><p class="zone-state" aria-live="polite"></p></div>
+      <div class="zone-card" data-zone="East"><div class="zone-title"><h3>East</h3><span class="zone-direction">Direction</span></div><label>Camera ID<input class="camera-id" maxlength="80" placeholder="e.g. CAM-E-01"></label><label>Recording date and time<input class="recorded-at" type="datetime-local"></label><label>Video clip<input class="clip-file" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,.m4v"></label><p class="zone-state" aria-live="polite"></p></div>
+    </div>
+    <div class="button-row"><button id="upload-clips" class="primary" disabled>Upload selected clips</button><span id="upload-summary" class="status" role="status" aria-live="polite"></span></div>
+  </section>
+
+  <section class="panel" aria-labelledby="search-title">
+    <div class="panel-head"><div><h2 id="search-title">Search the four directions</h2><p class="sub">Each direction receives its registered clip. Directions without footage remain marked as waiting; they will not create detections.</p></div><span class="step-tag">Step 3</span></div>
+    <div class="button-row"><button id="run-search" class="primary" disabled>Search registered clips</button><span id="search-summary" class="status" role="status" aria-live="polite"></span></div>
+    <div id="search-results" class="search-result-list" aria-live="polite"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="review-title">
+    <div class="panel-head"><div><h2 id="review-title">Review video candidates</h2><p class="sub">Check the clip and timestamp, then choose a review label. A person candidate can start neighboring-zone follow-up only after human confirmation.</p></div><span class="step-tag">Step 4</span></div>
+    <div class="toolbar"><label for="case-filter">Case filter</label><input id="case-filter" placeholder="All cases"><button id="refresh" class="secondary">Refresh candidates</button><span id="count" class="record-count" aria-live="polite"></span></div>
+    <section id="items" aria-live="polite" style="margin-top:14px"></section>
+  </section>
 </main>
 <script>
-const items = document.getElementById('items');
-const count = document.getElementById('count');
-const escapeText = value => String(value ?? '—');
-function element(tag, text, className) { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; }
-async function refresh() {
-  items.replaceChildren(element('div','Loading review records…','empty'));
-  const caseId = document.getElementById('case').value.trim();
-  const url = new URL('/api/v1/sightings', location.origin); if (caseId) url.searchParams.set('case_id',caseId);
-  try {
-    const response = await fetch(url); if (!response.ok) throw new Error(`API returned ${response.status}`);
-    const records = await response.json(); count.textContent = `${records.length} record${records.length===1?'':'s'}`; items.replaceChildren();
-    if (!records.length) { items.append(element('div','No video-derived sightings are stored. Upload a public or synthetic clip and run a zone analysis first.','empty')); return; }
-    for (const record of records) {
-      const card = element('article',undefined,'panel'); const title = element('h2',`${escapeText(record.vehicle_color)} ${escapeText(record.vehicle_type)} · ${escapeText(record.jurisdiction)}`); card.append(title);
-      const grid = element('div',undefined,'grid'); const media = document.createElement('video'); media.controls = true; media.preload = 'metadata'; media.src = `/api/v1/videos/${encodeURIComponent(record.video_source_id)}/file#t=${Number(record.video_offset_seconds)||0}`;
-      const info = element('div'); const meta = element('div',undefined,'meta');
-      for (const [label,value] of [['Case',record.case_id],['Camera',record.camera_id],['Timestamp',record.occurred_at],['Detector confidence',Number(record.detector_confidence).toFixed(3)],['Clue comparison',record.clue_match_score==null?'not scored':Number(record.clue_match_score).toFixed(2)],['Review',record.review_status]]) { const row=element('div'); row.append(element('strong',`${label}: `),document.createTextNode(escapeText(value))); meta.append(row); }
-      info.append(meta,element('div',`Evidence SHA-256: ${record.evidence_sha256}`,'hash'));
-      const note = document.createElement('input'); note.placeholder = 'Reviewer note (optional)'; note.maxLength = 2000; note.setAttribute('aria-label','Reviewer note');
-      const reviewer = document.createElement('input'); reviewer.value = 'Reviewer'; reviewer.maxLength = 120; reviewer.setAttribute('aria-label','Reviewer name');
-      const actions=element('div',undefined,'review');
-      for (const [label,decision] of [['Confirm candidate','confirmed_candidate'],['Not relevant','not_relevant'],['Needs more review','needs_more_review']]) {
-        const button=element('button',label,decision==='confirmed_candidate'?'primary':'quiet');
-        button.addEventListener('click',async()=>{ button.disabled=true; try { const response=await fetch(`/api/v1/sightings/${encodeURIComponent(record.id)}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision,reviewer:reviewer.value||'Reviewer',note:note.value})}); if(!response.ok) throw new Error((await response.json()).detail||`API returned ${response.status}`); await refresh(); } catch(error) { alert(`Review was not saved: ${error.message}`); button.disabled=false; } }); actions.append(button);
-      }
-      info.append(reviewer,note,actions); grid.append(media,info); card.append(grid); items.append(card);
+const zones = ["North","West","South","East"];
+const neighbors = {North:["East","West"],West:["North","South"],South:["East","West"],East:["North","South"]};
+const items = document.getElementById("items");
+const count = document.getElementById("count");
+let currentCaseId = "";
+function el(tag,text,className){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;}
+async function api(url,options){const response=await fetch(url,options);let body={};try{body=await response.json();}catch{}if(!response.ok)throw new Error(body.detail||("Request failed ("+response.status+")"));return body;}
+function setWorkflowStatus(text){document.getElementById("workflow-status").textContent=text;}
+function setCaseEnabled(enabled){document.getElementById("upload-clips").disabled=!enabled;document.getElementById("run-search").disabled=!enabled;document.getElementById("active-case-label").textContent=enabled?"Active case: "+currentCaseId:"Create a case to enable feed upload.";}
+document.getElementById("create-case").addEventListener("click",async()=>{
+  const caseId=document.getElementById("case-id").value.trim();
+  const description=document.getElementById("case-description").value.trim();
+  const initialZone=document.getElementById("initial-zone").value;
+  const status=document.getElementById("case-status");
+  const button=document.getElementById("create-case");
+  if(!caseId){status.textContent="Enter a case ID.";return;}
+  if(description.length<3){status.textContent="Add a short description of the visual clue.";return;}
+  button.disabled=true;status.textContent="Creating the case and parsing the clue with local Ollama…";
+  try{
+    const result=await api("/api/v1/investigations/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:caseId,description,initial_zone:initialZone,neighbors})});
+    currentCaseId=result.case_id;
+    const parsed=result.clue;
+    const targets=(parsed.visual_targets||[]).map(x=>(x.color?x.color+" ":"")+x.target_type+((x.attributes||[]).length?" — "+x.attributes.join(", "):"")).join("; ");
+    const summary=document.getElementById("case-summary");
+    summary.replaceChildren(el("strong","Case "+currentCaseId+" is ready"));
+    summary.append(el("div",targets?"Parsed clue: "+targets:"Parsed clue: no visual target was extracted; review the description."));
+    if(parsed.event_time_text)summary.append(el("div","Approximate time from clue: "+parsed.event_time_text));
+    summary.append(el("div","Starting direction: "+result.initial_zone+" · Four direction workers ready"));
+    summary.classList.add("visible");
+    setCaseEnabled(true);status.textContent="Case saved locally. Check the parsed clue above, then add camera feeds.";
+    setWorkflowStatus("Case ready. Add synthetic or public footage to the directions you want to search.");
+  }catch(error){status.textContent="Case was not created: "+error.message;}
+  finally{button.disabled=false;}
+});
+document.getElementById("transcribe-clue").addEventListener("click",async()=>{
+  const file=document.getElementById("clue-audio").files[0];
+  const status=document.getElementById("transcript-status");
+  if(!file){status.textContent="Choose a short audio recording first.";return;}
+  const button=document.getElementById("transcribe-clue");button.disabled=true;status.textContent="Transcribing on this computer…";
+  const body=new FormData();body.append("file",file,file.name);
+  try{const result=await api("/api/v1/clues/transcribe",{method:"POST",body});document.getElementById("case-description").value=result.transcript;status.textContent="Transcript ready. Review it in the clue box, then create the case.";}
+  catch(error){status.textContent="Local transcription unavailable: "+error.message;}
+  finally{button.disabled=false;}
+});
+document.getElementById("use-transcript").addEventListener("click",()=>{
+  const transcript=document.getElementById("case-description").value.trim();
+  const status=document.getElementById("transcript-status");
+  if(!transcript){status.textContent="Transcribe or type the clue first.";return;}
+  status.textContent="The reviewed clue is in the case description above.";
+  document.getElementById("case-description").focus();
+});
+document.getElementById("upload-clips").addEventListener("click",async()=>{
+  const selected=[...document.querySelectorAll(".zone-card")].filter(card=>card.querySelector(".clip-file").files[0]);
+  const summary=document.getElementById("upload-summary");
+  if(!currentCaseId){summary.textContent="Create a case first.";return;}
+  if(!selected.length){summary.textContent="Choose at least one public or synthetic clip.";return;}
+  const button=document.getElementById("upload-clips");button.disabled=true;let succeeded=0;
+  for(let i=0;i<selected.length;i++){
+    const card=selected[i];const zone=card.dataset.zone;const camera=card.querySelector(".camera-id").value.trim();const recordedValue=card.querySelector(".recorded-at").value;const file=card.querySelector(".clip-file").files[0];const state=card.querySelector(".zone-state");
+    summary.textContent="Uploading clip "+(i+1)+" of "+selected.length+"…";
+    if(!camera||!recordedValue){state.textContent="Add the camera ID and actual recording time.";continue;}
+    const recorded=new Date(recordedValue);if(Number.isNaN(recorded.getTime())){state.textContent="Recording time is invalid.";continue;}
+    const body=new FormData();body.append("case_id",currentCaseId);body.append("jurisdiction",zone);body.append("camera_id",camera);body.append("recorded_at",recorded.toISOString());body.append("file",file,file.name);
+    try{const result=await api("/api/v1/videos",{method:"POST",body});state.textContent="Stored locally · "+Math.round(result.duration_seconds)+" sec · SHA-256 "+result.sha256.slice(0,16)+"…";succeeded++;}
+    catch(error){state.textContent="Upload failed: "+error.message;}
+  }
+  summary.textContent=succeeded+" of "+selected.length+" selected clip(s) stored locally.";
+  button.disabled=false;
+  if(succeeded)setWorkflowStatus("Clips registered. Run the four direction search when ready.");
+});
+document.getElementById("run-search").addEventListener("click",async()=>{
+  if(!currentCaseId){document.getElementById("search-summary").textContent="Create a case first.";return;}
+  const button=document.getElementById("run-search");const summary=document.getElementById("search-summary");const output=document.getElementById("search-results");
+  button.disabled=true;summary.textContent="Preparing four direction workers…";output.replaceChildren();
+  try{
+    const workItems=zones.map(zone=>({case_id:currentCaseId,worker_id:"zone_worker_"+zone.toLowerCase(),jurisdiction:zone,neighbors:neighbors[zone],description:document.getElementById("case-description").value.trim()}));
+    const resolved=await api("/api/v1/work-items/resolve",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:currentCaseId,items:workItems})});
+    summary.textContent=resolved.ready_count+" clip(s) ready across four directions. Analysis is running locally…";
+    const analysis=await api("/api/v1/zones/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:currentCaseId,items:resolved.items})});
+    let candidates=0;let awaiting=0;
+    for(const result of analysis.results||[]){
+      const found=(result.candidate_sightings||[]).length;candidates+=found;
+      if(result.status==="awaiting_local_video")awaiting++;
+      const row=el("div",undefined,"search-result");
+      row.append(el("strong",result.jurisdiction||"Direction"));
+      const detail=result.status==="completed"?(found+" unreviewed candidate(s) · clip analysis complete"):result.status==="awaiting_local_video"?"Waiting for a registered camera clip":(result.detail||result.status||"Search status unavailable");
+      row.append(el("span",detail,"result-state"));output.append(row);
     }
-  } catch(error) { count.textContent=''; items.replaceChildren(element('div',`Could not load review records: ${error.message}`,'empty')); }
+    summary.textContent=candidates+" unreviewed candidate(s) from "+resolved.ready_count+" clip(s); "+awaiting+" direction(s) waiting for footage.";
+    summary.className="status "+(candidates?"summary-wait":"summary-good");
+    setWorkflowStatus("Search finished. Review each actual video candidate below; no identity is asserted.");
+    await refresh();
+  }catch(error){summary.textContent="Search could not finish: "+error.message;setWorkflowStatus("Search stopped. Check the local service and case setup.");}
+  finally{button.disabled=false;}
+});
+async function refresh(){
+  items.replaceChildren(el("div","Loading review records…","empty"));
+  const caseId=document.getElementById("case-filter").value.trim();
+  const url=new URL("/api/v1/sightings",location.origin);if(caseId)url.searchParams.set("case_id",caseId);
+  try{
+    const records=await api(url.toString());
+    count.textContent=records.length+" candidate record"+(records.length===1?"":"s");
+    items.replaceChildren();
+    if(!records.length){items.append(el("div","No video-derived candidates are stored. After a clip search, any actual candidates will appear here for review.","empty"));return;}
+    for(const record of records){
+      const card=el("article",undefined,"record");
+      const targetType=record.subject_type||record.vehicle_type;
+      card.append(el("h3",(record.vehicle_color?record.vehicle_color+" ":"")+targetType+" · "+record.jurisdiction,"record-title"));
+      const grid=el("div",undefined,"record-grid");
+      const video=document.createElement("video");video.controls=true;video.preload="metadata";video.src="/api/v1/videos/"+encodeURIComponent(record.video_source_id)+"/file#t="+(Number(record.video_offset_seconds)||0);
+      const info=el("div");
+      const meta=el("div",undefined,"record-meta");
+      for(const pair of [["Case",record.case_id],["Camera",record.camera_id],["Timestamp",record.occurred_at],["Confidence",Number(record.detector_confidence).toFixed(3)],["Clue comparison",record.clue_match_score==null?"not scored":Number(record.clue_match_score).toFixed(2)],["Review status",record.review_status]]){
+        const row=el("div");row.append(el("strong",pair[0]+": "),document.createTextNode(String(pair[1]??"—")));meta.append(row);
+      }
+      info.append(meta);
+      const requested=record.clue&&record.clue.visual_targets||[];
+      if(requested.length){info.append(el("p","Requested clue: "+requested.map(x=>((x.color||"")+" "+(x.target_type||"target")+(x.attributes&&x.attributes.length?" ("+x.attributes.join("; ")+")":"")).trim()).join(" · ")+" · visible details require human verification."));}
+      else if(record.clue&&record.clue.source_text)info.append(el("p","Requested clue: "+record.clue.source_text+" · human verification required."));
+      if(Array.isArray(record.visual_attributes)&&record.visual_attributes.length)info.append(el("p","Approximate observed cues: "+record.visual_attributes.join("; ")+" · check against the clip."));
+      info.append(el("div","Evidence SHA-256: "+record.evidence_sha256,"hash"));
+      const reviewer=document.createElement("input");reviewer.placeholder="Reviewer name";reviewer.maxLength=120;reviewer.setAttribute("aria-label","Reviewer name");
+      const note=document.createElement("input");note.placeholder="Review note (optional)";note.maxLength=2000;note.setAttribute("aria-label","Review note");
+      const fields=el("div",undefined,"review-fields");fields.append(reviewer,note);info.append(fields);
+      const actions=el("div",undefined,"review-actions");
+      for(const option of [["Confirm candidate","confirmed_candidate"],["Not relevant","not_relevant"],["Needs more review","needs_more_review"]]){
+        const button=el("button",option[0],option[1]==="confirmed_candidate"?"primary":"quiet");
+        button.addEventListener("click",async()=>{
+          if(!reviewer.value.trim()){reviewer.focus();return;}
+          button.disabled=true;
+          try{await api("/api/v1/sightings/"+encodeURIComponent(record.id)+"/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({decision:option[1],reviewer:reviewer.value.trim(),note:note.value})});await refresh();}
+          catch(error){alert("Review was not saved: "+error.message);button.disabled=false;}
+        });
+        actions.append(button);
+      }
+      info.append(actions);grid.append(video,info);card.append(grid);items.append(card);
+    }
+  }catch(error){count.textContent="";items.replaceChildren(el("div","Could not load candidates: "+error.message,"empty"));}
 }
-document.getElementById('refresh').addEventListener('click',refresh); refresh();
+document.getElementById("refresh").addEventListener("click",refresh);
+refresh();
 </script>
 </body>
 </html>

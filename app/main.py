@@ -1,29 +1,60 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
 import mimetypes
 import os
+import secrets
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from . import db
 from .ollama_client import OLLAMA_BASE_URL, OLLAMA_MODEL, parse_vehicle_clues
-from .schemas import AnalyzeZoneRequest, CaseCreate, ClueParseRequest, ResolveWorkItemsRequest, ReviewDecision
+from .schemas import AnalyzeZoneRequest, AnalyzeZonesRequest, CaseCreate, ClueParseRequest, ResolveWorkItemsRequest, ReviewDecision
 from .video_analysis import analyze_video
 
 
 app = FastAPI(title="CCTV Investigation Agent Local API", version="0.1.0")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "1024")) * 1024 * 1024
 FOLLOWUP_THRESHOLD = float(os.getenv("FOLLOWUP_MATCH_THRESHOLD", "0.70"))
+VIDEO_WORKER_CONCURRENCY = max(1, min(4, int(os.getenv("VIDEO_WORKER_CONCURRENCY", "1"))))
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".flac"}
+REVIEW_USERNAME = os.getenv("REVIEW_USERNAME", "")
+REVIEW_PASSWORD = os.getenv("REVIEW_PASSWORD", "")
+review_auth = HTTPBasic(auto_error=False)
+
+
+def require_reviewer(credentials: HTTPBasicCredentials | None = Depends(review_auth)) -> str:
+    if not REVIEW_USERNAME or not REVIEW_PASSWORD:
+        raise HTTPException(status_code=503, detail="Reviewer access is not configured")
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Reviewer authentication required", headers={"WWW-Authenticate": "Basic"})
+    username_ok = secrets.compare_digest(credentials.username, REVIEW_USERNAME)
+    password_ok = secrets.compare_digest(credentials.password, REVIEW_PASSWORD)
+    if not (username_ok and password_ok):
+        raise HTTPException(status_code=401, detail="Invalid reviewer credentials", headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
+
+
+@lru_cache(maxsize=1)
+def _whisper_model():
+    from faster_whisper import WhisperModel
+
+    device = os.getenv("WHISPER_DEVICE", "cpu").strip().lower()
+    compute_type = "float16" if device == "cuda" else "int8"
+    return WhisperModel(os.getenv("WHISPER_MODEL", "base"), device=device, compute_type=compute_type)
 
 
 @app.on_event("startup")
@@ -80,6 +111,39 @@ def _attach_waiting_followups(conn, case_id: str, zone: str) -> list[str]:
 def _match_score(detection: dict[str, Any], clue: dict[str, Any] | None) -> float | None:
     if not clue:
         return None
+    targets = clue.get("visual_targets") or []
+    if targets:
+        observed_type = str(detection.get("subject_type") or detection.get("vehicle_type") or "").strip().lower()
+        observed_color = str(detection.get("vehicle_color") or "").strip().lower()
+
+        def canonical_type(value: str) -> str:
+            normalized = value.strip().lower()
+            aliases = {
+                "pedestrian": "person", "man": "person", "woman": "person", "cyclist": "person",
+                "sedan": "car", "suv": "car", "van": "car", "hatchback": "car", "automobile": "car",
+                "bike": "bicycle", "cycle": "bicycle", "motorbike": "motorcycle", "scooter": "motorcycle",
+                "lorry": "truck",
+            }
+            return aliases.get(normalized, normalized)
+
+        scores: list[float] = []
+        for target in targets:
+            expected_type = canonical_type(str(target.get("target_type") or ""))
+            checks: list[float] = []
+            if expected_type and expected_type != "other":
+                checks.append(1.0 if canonical_type(observed_type) == expected_type else 0.0)
+            expected_color = str(target.get("color") or "").strip().lower()
+            if expected_color:
+                checks.append(1.0 if expected_color in observed_color else 0.0)
+            if checks:
+                score = sum(checks) / len(checks)
+                # A generic person-class hit is only a review candidate, not a match.
+                if expected_type == "person" and not expected_color and score > 0:
+                    score = 0.25
+                scores.append(score)
+        # Free-text marks/accessories are shown to a reviewer, never machine-scored.
+        return max(scores) if scores else None
+
     checks: list[float] = []
     expected_color = (clue.get("vehicle_color") or "").strip().lower()
     if expected_color:
@@ -146,7 +210,7 @@ def _video_runtime_status() -> dict[str, Any]:
 
 
 @app.get("/", include_in_schema=False)
-def review_home():
+def review_home(_: str = Depends(require_reviewer)):
     return FileResponse(Path(__file__).parent / "static" / "review.html")
 
 
@@ -166,7 +230,7 @@ async def health():
         "ollama_model": OLLAMA_MODEL,
         "ollama_available_models": ollama_models,
         "yolo_model": os.getenv("YOLO_MODEL", "yolo11n.pt"),
-        "yolo_device": os.getenv("YOLO_DEVICE", "0"),
+        "yolo_device": os.getenv("YOLO_DEVICE", "auto"),
         "video_runtime": _video_runtime_status(),
         "face_identification": "not implemented",
         "evidence_directory": str(db.EVIDENCE_DIR),
@@ -175,7 +239,7 @@ async def health():
 
 @app.post("/api/v1/investigations/start", status_code=201)
 async def start_investigation(request: CaseCreate):
-    """Create/reuse a matching case and extract its vehicle clues with local Ollama."""
+    """Create/reuse a matching case and extract visible-target clues with local Ollama."""
     db.initialize()
     with db.connection() as conn:
         existing = conn.execute("SELECT * FROM cases WHERE case_id=?", (request.case_id,)).fetchone()
@@ -260,8 +324,45 @@ async def parse_clues(request: ClueParseRequest):
     return clue.model_dump()
 
 
+@app.post("/api/v1/clues/transcribe")
+async def transcribe_clue_audio(
+    _: str = Depends(require_reviewer),
+    file: UploadFile = File(...),
+):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=415, detail=f"Supported audio extensions: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}")
+    audio_bytes = await file.read(100 * 1024 * 1024 + 1)
+    if len(audio_bytes) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio recording exceeds the 100 MB limit")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="cctv-clue-", suffix=suffix, delete=False) as temp_audio:
+            temp_audio.write(audio_bytes)
+            temp_path = Path(temp_audio.name)
+        segments, info = _whisper_model().transcribe(
+            str(temp_path), beam_size=1, condition_on_previous_text=False,
+        )
+        transcript = " ".join(segment.text.strip() for segment in segments).strip()
+        if not transcript:
+            raise HTTPException(status_code=422, detail="No speech was recognized in the recording")
+        return {"transcript": transcript, "language": info.language, "language_probability": info.language_probability,
+                "transcription_model": os.getenv("WHISPER_MODEL", "base"), "stored": False}
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="Local audio transcription is not installed; install requirements-audio.txt") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Local audio transcription failed: {type(exc).__name__}: {exc}") from exc
+    finally:
+        await file.close()
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+
 @app.post("/api/v1/videos", status_code=201)
 async def upload_video(
+    _: str = Depends(require_reviewer),
     case_id: str = Form(...),
     jurisdiction: str = Form(...),
     camera_id: str = Form(...),
@@ -325,7 +426,7 @@ async def upload_video(
 
 
 @app.get("/api/v1/videos")
-def list_videos(case_id: str | None = None, jurisdiction: str | None = None):
+def list_videos(case_id: str | None = None, jurisdiction: str | None = None, _: str = Depends(require_reviewer)):
     db.initialize()
     query = "SELECT video_source_id,case_id,jurisdiction,camera_id,original_name,recorded_at,sha256,byte_size,duration_seconds,created_at FROM videos WHERE 1=1"
     params: list[str] = []
@@ -409,7 +510,7 @@ def resolve_work_items(request: ResolveWorkItemsRequest):
 
 
 @app.get("/api/v1/videos/{video_source_id}/file")
-def get_video_file(video_source_id: str):
+def get_video_file(video_source_id: str, _: str = Depends(require_reviewer)):
     db.initialize()
     with db.connection() as conn:
         row = conn.execute("SELECT file_path,original_name FROM videos WHERE video_source_id=?", (video_source_id,)).fetchone()
@@ -420,6 +521,55 @@ def get_video_file(video_source_id: str):
         media_type=mimetypes.guess_type(row["original_name"])[0] or "video/mp4",
         headers={"Content-Disposition": "inline"},
     )
+
+
+@app.post("/api/v1/zones/analyze")
+async def analyze_zones(request: AnalyzeZonesRequest):
+    """Dispatch the four directional work items together, with a local inference limit."""
+    with db.connection() as conn:
+        case = _case_or_404(conn, request.case_id)
+        allowed_zones = _case_zones(case)
+    slots = asyncio.Semaphore(VIDEO_WORKER_CONCURRENCY)
+
+    async def run_item(item: dict[str, Any]) -> dict[str, Any]:
+        if item.get("case_id") not in (None, request.case_id):
+            return {"status": "failed", "http_status": 409, "detail": "Work item case_id does not match the request"}
+        zone = str(item.get("jurisdiction") or "").strip()
+        if zone not in allowed_zones:
+            return {"status": "failed", "http_status": 422, "detail": f"Jurisdiction is not part of this case's zone map: {zone or '(empty)'}"}
+        if not item.get("video_source_id"):
+            return {
+                "status": "awaiting_local_video",
+                "case_id": item.get("case_id"),
+                "worker_id": item.get("worker_id"),
+                "jurisdiction": item.get("jurisdiction"),
+                "candidate_sightings": [],
+                "follow_up_jobs": [],
+            }
+        try:
+            payload = AnalyzeZoneRequest(**item)
+            async with slots:
+                result = await asyncio.to_thread(analyze_zone, payload)
+            return {"status": "completed", **result}
+        except HTTPException as exc:
+            return {
+                "status": "failed", "http_status": exc.status_code, "detail": exc.detail,
+                "case_id": item.get("case_id"), "worker_id": item.get("worker_id"),
+                "jurisdiction": item.get("jurisdiction"), "candidate_sightings": [],
+            }
+        except Exception as exc:
+            return {
+                "status": "failed", "http_status": 500, "detail": f"{type(exc).__name__}: {exc}",
+                "case_id": item.get("case_id"), "worker_id": item.get("worker_id"),
+                "jurisdiction": item.get("jurisdiction"), "candidate_sightings": [],
+            }
+
+    results = await asyncio.gather(*(run_item(item) for item in request.items))
+    return {
+        "worker_count": len(results),
+        "inference_concurrency_limit": VIDEO_WORKER_CONCURRENCY,
+        "results": results,
+    }
 
 
 @app.post("/api/v1/zone/analyze")
@@ -455,27 +605,33 @@ def analyze_zone(request: AnalyzeZoneRequest):
             occurred = detection["first_seen_at"]
             if isinstance(occurred, datetime):
                 occurred = _iso(occurred)
+            subject_type = detection.get("subject_type") or detection.get("vehicle_type") or "vehicle"
+            visual_attributes = detection.get("visual_attributes") or []
             integrity_payload = {
                 "video_sha256": video["sha256"], "case_id": request.case_id, "worker_id": request.worker_id,
                 "jurisdiction": request.jurisdiction, "camera_id": video["camera_id"], "occurred_at": occurred,
                 "video_offset_seconds": detection["start_offset_seconds"], "vehicle_type": detection["vehicle_type"],
                 "vehicle_color": detection.get("vehicle_color"), "detector_confidence": detection["detector_confidence"],
+                "subject_type": subject_type, "visual_attributes": visual_attributes,
             }
             evidence_hash = hashlib.sha256((video["sha256"] + db.canonical_json(integrity_payload)).encode("utf-8")).hexdigest()
             conn.execute(
-                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sighting_id, request.case_id, request.worker_id, request.jurisdiction, video["camera_id"], request.video_source_id,
                  occurred, detection["start_offset_seconds"], detection.get("track_id"), detection["vehicle_type"], detection.get("vehicle_color"),
-                 detection["detector_confidence"], score, evidence_hash, "pending", db.utc_now()),
+                 subject_type, db.canonical_json(visual_attributes), 2, detection["detector_confidence"], score, evidence_hash, "pending", db.utc_now()),
             )
             sighting = {"id": sighting_id, "case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
                         "camera_id": video["camera_id"], "video_source_id": request.video_source_id, "occurred_at": occurred,
                         "video_offset_seconds": detection["start_offset_seconds"], "track_id": detection.get("track_id"),
                         "vehicle_type": detection["vehicle_type"], "vehicle_color": detection.get("vehicle_color"),
+                        "subject_type": subject_type, "visual_attributes": visual_attributes,
+                        "attributes_require_human_review": True,
                         "detector_confidence": detection["detector_confidence"], "clue_match_score": score,
                         "evidence_sha256": evidence_hash, "review_status": "pending"}
             sightings.append(sighting)
-            if score is not None and score >= FOLLOWUP_THRESHOLD:
+            # Do not link or propagate a person candidate across cameras/zones.
+            if subject_type != "person" and score is not None and score >= FOLLOWUP_THRESHOLD:
                 follow_start = datetime.fromisoformat(detection["last_seen_at"].isoformat())
                 follow_end = follow_start + timedelta(minutes=10)
                 for zone in neighbor_zones:
@@ -491,39 +647,79 @@ def analyze_zone(request: AnalyzeZoneRequest):
         db.audit(conn, "zone_analysis_completed", {"case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
                                                      "video_source_id": request.video_source_id, "sighting_count": len(sightings), "followup_count": len(followups)})
     return {"case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
-            "video_source_id": request.video_source_id, "video_sha256": video["sha256"], "analysis_engine": "ultralytics-yolo-vehicle-tracking",
-            "facial_identification": "not performed", "candidate_sightings": sightings, "follow_up_jobs": followups,
+            "video_source_id": request.video_source_id, "video_sha256": video["sha256"], "analysis_engine": "ultralytics-yolo-visible-target-tracking",
+            "target_scope": "people and common vehicles/objects; one-clip tracking only",
+            "facial_identification": "not performed", "cross_camera_identity_matching": "not performed",
+            "candidate_sightings": sightings, "follow_up_jobs": followups,
             "human_review_required": True}
 
 
 @app.get("/api/v1/sightings")
-def list_sightings(case_id: str | None = None, review_status: str | None = None):
+def list_sightings(case_id: str | None = None, review_status: str | None = None, _: str = Depends(require_reviewer)):
     db.initialize()
-    query = "SELECT * FROM sightings WHERE 1=1"
+    query = "SELECT s.*,c.clues_json AS case_clues_json FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE 1=1"
     params: list[str] = []
     if case_id:
-        query += " AND case_id=?"
+        query += " AND s.case_id=?"
         params.append(case_id)
     if review_status:
-        query += " AND review_status=?"
+        query += " AND s.review_status=?"
         params.append(review_status)
-    query += " ORDER BY occurred_at DESC"
+    query += " ORDER BY s.occurred_at DESC"
     with db.connection() as conn:
         rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+    records = []
+    for row in rows:
+        record = dict(row)
+        clue_text = record.pop("case_clues_json")
+        record["clue"] = json.loads(clue_text) if clue_text else None
+        record["visual_attributes"] = json.loads(record["visual_attributes_json"] or "[]")
+        record["subject_type"] = record["subject_type"] or record["vehicle_type"]
+        records.append(record)
+    return records
 
 
 @app.post("/api/v1/sightings/{sighting_id}/review")
-def review_sighting(sighting_id: str, decision: ReviewDecision):
+def review_sighting(sighting_id: str, decision: ReviewDecision, _: str = Depends(require_reviewer)):
     db.initialize()
+    dispatched_followups: list[str] = []
     with db.connection() as conn:
-        row = conn.execute("SELECT id,case_id,review_status FROM sightings WHERE id=?", (sighting_id,)).fetchone()
+        row = conn.execute(
+            "SELECT s.id,s.case_id,s.subject_type,s.vehicle_type,s.jurisdiction,s.occurred_at,c.neighbors_json "
+            "FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE s.id=?",
+            (sighting_id,),
+        ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Sighting not found")
         conn.execute("UPDATE sightings SET review_status=?,reviewer=?,review_note=? WHERE id=?",
                      (decision.decision, decision.reviewer, decision.note, sighting_id))
         db.audit(conn, "human_review_recorded", {"sighting_id": sighting_id, "case_id": row["case_id"], **decision.model_dump()})
-    return {"sighting_id": sighting_id, "review_status": decision.decision, "reviewer": decision.reviewer}
+        subject_type = row["subject_type"] or row["vehicle_type"]
+        if decision.decision == "confirmed_candidate" and subject_type == "person":
+            neighbor_map = json.loads(row["neighbors_json"])
+            start = _parse_timestamp(row["occurred_at"])
+            end = start + timedelta(minutes=10)
+            for zone in dict.fromkeys(neighbor_map.get(row["jurisdiction"], [])):
+                if not zone or zone == row["jurisdiction"]:
+                    continue
+                video = _matching_video_for_window(conn, row["case_id"], zone, start, end)
+                followup_id = str(uuid.uuid4())
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO followups(id,case_id,source_sighting_id,target_zone,window_start,window_end,video_source_id,status,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (followup_id, row["case_id"], sighting_id, zone, _iso(start), _iso(end),
+                     video["video_source_id"] if video else None,
+                     "pending" if video else "awaiting_video", db.utc_now()),
+                )
+                if cursor.rowcount:
+                    dispatched_followups.append(zone)
+            if dispatched_followups:
+                db.audit(conn, "person_candidate_followups_queued", {
+                    "sighting_id": sighting_id, "case_id": row["case_id"],
+                    "target_zones": dispatched_followups, "human_review_gated": True,
+                })
+    return {"sighting_id": sighting_id, "review_status": decision.decision, "reviewer": decision.reviewer,
+            "follow_up_zones_queued": dispatched_followups}
 
 
 @app.get("/api/v1/followups")
@@ -645,6 +841,9 @@ def integrity_status():
                 "video_offset_seconds": sighting["video_offset_seconds"], "vehicle_type": sighting["vehicle_type"],
                 "vehicle_color": sighting["vehicle_color"], "detector_confidence": sighting["detector_confidence"],
             }
+            if int(sighting["integrity_version"] or 1) >= 2:
+                payload["subject_type"] = sighting["subject_type"]
+                payload["visual_attributes"] = json.loads(sighting["visual_attributes_json"])
             expected = hashlib.sha256((sighting["video_sha256"] + db.canonical_json(payload)).encode("utf-8")).hexdigest()
             if expected != sighting["evidence_sha256"]:
                 invalid_sightings.append(sighting["id"])

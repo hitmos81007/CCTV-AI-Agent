@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+TARGET_CLASSES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 
 def _resolve_device(configured: str | None = None, cuda_available: bool | None = None) -> int | str:
@@ -28,7 +28,7 @@ def _model() -> Any:
     return YOLO(os.getenv("YOLO_MODEL", "yolo11n.pt"))
 
 
-def _vehicle_color(frame, xyxy: list[float]) -> str | None:
+def _dominant_color(frame, xyxy: list[float], target_type: str) -> str | None:
     import cv2
 
     height, width = frame.shape[:2]
@@ -37,7 +37,11 @@ def _vehicle_color(frame, xyxy: list[float]) -> str | None:
     y1, y2 = max(0, y1), min(height, y2)
     if x2 <= x1 or y2 <= y1:
         return None
-    crop = frame[y1 + (y2 - y1) // 3 : y2, x1:x2]
+    if target_type == "person":
+        # Approximate clothing color from the torso only; never inspect the head/face.
+        crop = frame[y1 + (y2 - y1) * 2 // 5 : y1 + (y2 - y1) * 4 // 5, x1:x2]
+    else:
+        crop = frame[y1 + (y2 - y1) // 3 : y2, x1:x2]
     if crop.size == 0:
         return None
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -60,7 +64,11 @@ def _vehicle_color(frame, xyxy: list[float]) -> str | None:
 
 
 def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0.30) -> list[dict[str, Any]]:
-    """Track vehicle classes only. No person, face, or plate analysis is performed."""
+    """Track visible people and common vehicles/objects within one clip only.
+
+    Track IDs are ephemeral to this one video. No face, license-plate, biometric,
+    or cross-camera identity matching is performed.
+    """
     import cv2
 
     path = str(path)
@@ -86,14 +94,15 @@ def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0
         confidences = boxes.conf.cpu().tolist()
         xyxys = boxes.xyxy.cpu().tolist()
         for index, class_id in enumerate(classes):
-            if class_id not in VEHICLE_CLASSES:
+            if class_id not in TARGET_CLASSES:
                 continue
             track_id = ids[index]
             if track_id is None:
                 continue
             key = str(track_id)
             confidence_value = float(confidences[index])
-            color = _vehicle_color(frame, xyxys[index])
+            target_type = TARGET_CLASSES[class_id]
+            color = _dominant_color(frame, xyxys[index], target_type)
             current = tracks.get(key)
             if current is None:
                 tracks[key] = {
@@ -102,8 +111,10 @@ def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0
                     "last_seen_at": frame_time,
                     "start_offset_seconds": frame_index / fps,
                     "end_offset_seconds": frame_index / fps,
-                    "vehicle_type": VEHICLE_CLASSES[class_id],
+                    "subject_type": target_type,
+                    "vehicle_type": target_type,
                     "vehicle_color": color,
+                    "visual_attributes": ([f"approximate torso color: {color}"] if target_type == "person" and color else []),
                     "detector_confidence": confidence_value,
                 }
             else:
@@ -112,6 +123,8 @@ def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0
                 if confidence_value > current["detector_confidence"]:
                     current["detector_confidence"] = confidence_value
                     current["vehicle_color"] = color
-                    current["vehicle_type"] = VEHICLE_CLASSES[class_id]
+                    current["subject_type"] = target_type
+                    current["vehicle_type"] = target_type
+                    current["visual_attributes"] = ([f"approximate torso color: {color}"] if target_type == "person" and color else [])
     return list(tracks.values())
 

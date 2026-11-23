@@ -1,0 +1,2 @@
+# Optional offline voice-to-text support for spoken case clues.
+faster-whisper>=1.1

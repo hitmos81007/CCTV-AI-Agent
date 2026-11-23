@@ -1,1 +1,484 @@
-[{"updatedAt":"2026-11-22T15:04:46.140Z","createdAt":"2026-11-21T17:16:56.184Z","id":"zrdrZ9NZeWe0u8bM","name":"CCTV Investigation Orchestrator — Demo","description":null,"active":false,"isArchived":false,"nodes":[{"parameters":{},"type":"n8n-nodes-base.manualTrigger","typeVersion":1,"position":[0,96],"id":"6780b274-f5be-43b4-9752-3063959ff174","name":"When clicking ‘Execute workflow’"},{"parameters":{"assignments":{"assignments":[{"id":"c7c023be-9fbd-4422-9aed-fd9d62f92b89","name":"case_id","value":"DEMO-001","type":"string"},{"id":"409e790b-40d7-4fc3-b7c6-ce70f938f26e","name":"description","value":"SYNTHETIC DEMO — white sedan near Central Road, approximately 10:15; review vehicle color and direction only.","type":"string"},{"id":"60753740-ab5e-4851-adbc-8313b385137e","name":"initial_zone","value":"North","type":"string"},{"id":"b4c2f1e2-3f91-4ca7-aa06-e68196e66314","name":"neighbors","value":"{\"North\":[\"East\",\"West\"],\"South\":[\"East\",\"West\"],\"East\":[\"North\",\"South\"],\"West\":[\"North\",\"South\"],\"Central\":[\"North\",\"South\"]}","type":"object"}]},"options":{}},"type":"n8n-nodes-base.set","typeVersion":3.5,"position":[224,96],"id":"3aea2846-7a93-48ac-ad52-3dc573923572","name":"Police Case Input"},{"parameters":{"jsCode":"const c = $input.first().json;\nconst neighborMap = c.neighbors || {};\nconst adjacent = Array.isArray(neighborMap[c.initial_zone]) ? neighborMap[c.initial_zone] : [];\nconst zones = [c.initial_zone, ...adjacent].filter((zone, i, all) => zone && all.indexOf(zone) === i).slice(0, 3);\nreturn [{ json: { ...c, investigation_plan: { mode: 'synthetic_demo_only', evidence_scope: 'vehicle attributes and timestamps only; no facial identification', human_review_required: true, zones_to_review: zones, workers: zones.map((zone, i) => ({ worker_id: `zone_worker_${i + 1}`, jurisdiction: zone, status: 'awaiting_video_backend', candidate_sightings: [] })), follow_up_zones: zones.slice(1), sha256_integrity: 'computed_by_local_backend_when_evidence_is_attached' } } }];"},"type":"n8n-nodes-base.code","typeVersion":2,"position":[672,16],"id":"f4dc2895-5581-4f68-baef-a23f6a4e170e","name":"Investigation Planner (demo)"},{"parameters":{"jsCode":"const c = $input.first().json;\nconst plan = c.investigation_plan;\nconst videosByZone = new Map();\nfor (const video of c.registered_videos || []) {\n  if (!videosByZone.has(video.jurisdiction)) videosByZone.set(video.jurisdiction, []);\n  videosByZone.get(video.jurisdiction).push(video);\n}\nreturn plan.workers.flatMap((worker) => {\n  const zoneNeighbors = c.neighbors?.[worker.jurisdiction] || [];\n  const videos = videosByZone.get(worker.jurisdiction) || [];\n  const assignments = videos.length ? videos : [null];\n  return assignments.map((video) => ({ json: {\n    case_id: c.case_id,\n    worker_id: worker.worker_id,\n    jurisdiction: worker.jurisdiction,\n    status: video ? 'ready_for_analysis' : 'awaiting_local_video',\n    video_source_id: video?.video_source_id || null,\n    camera_id: video?.camera_id || null,\n    video_recorded_at: video?.recorded_at || null,\n    video_sha256: video?.sha256 || null,\n    description: c.description,\n    clue: c.clue || null,\n    neighbors: zoneNeighbors,\n    analysis_request: { description: c.description, clue: c.clue || null, attributes_only: true, exclude_face_identification: true },\n    candidate_sightings: [],\n    evidence_sha256: null,\n    human_review: { required: true, status: 'pending' },\n    follow_up_of: worker.jurisdiction === c.initial_zone ? null : c.initial_zone\n  } }));\n});"},"type":"n8n-nodes-base.code","typeVersion":2,"position":[896,16],"id":"1d6404fa-10e7-495c-9364-3caf9f26a5b0","name":"Zone Review Queue (demo)"},{"parameters":{"method":"POST","url":"http://host.docker.internal:8000/api/v1/zone/analyze","sendBody":true,"specifyBody":"json","jsonBody":"={{$json}}","options":{}},"type":"n8n-nodes-base.httpRequest","typeVersion":4.5,"position":[1344,96],"id":"39a99df6-c38e-4d94-8b7b-72352b240aa8","name":"Local Video API (backend required)"},{"parameters":{"content":"## Live status — 2026-11-22\nn8n → FastAPI → Ollama succeeded (HTTP 201); clue persisted.\nThree zone items reached the guard; no clip, no analysis or sightings.\nIsolated database integrity passed; hashes and audit chain are valid.\nNext: upload synthetic/public clip and test YOLO on GPU.\nVehicle-only; no face ID; human review required.","height":336},"type":"n8n-nodes-base.stickyNote","position":[288,-640],"typeVersion":1,"id":"0213d599-0589-4de5-9ebb-bf5cc2dbaec8","name":"Sticky Note"},{"parameters":{"rule":{"interval":[{"field":"minutes"}]}},"type":"n8n-nodes-base.scheduleTrigger","typeVersion":1.4,"position":[0,-208],"id":"606bd02f-b57a-4d15-893b-7e2fa945affe","name":"Schedule Trigger"},{"parameters":{"fieldToSplitOut":"items","options":{}},"type":"n8n-nodes-base.splitOut","typeVersion":1.1,"position":[448,-208],"id":"adb8bc64-2c17-4282-8ad5-e7af1c49be15","name":"Split Out"},{"parameters":{"url":"http://host.docker.internal:8000/api/v1/followups/ready","options":{}},"type":"n8n-nodes-base.httpRequest","typeVersion":4.5,"position":[224,-208],"id":"9d92b5d9-c090-42fc-b159-6cb37b602fea","name":"List Ready Follow-ups"},{"parameters":{"method":"POST","url":"=  {{ 'http://host.docker.internal:8000' + $json.analysis_url }}","options":{}},"type":"n8n-nodes-base.httpRequest","typeVersion":4.5,"position":[672,-208],"id":"b0bed00a-67d7-4ef5-8d52-b01a8549b696","name":"Analyze Follow-up Zone"},{"parameters":{"method":"POST","url":"http://host.docker.internal:8000/api/v1/investigations/start","sendBody":true,"specifyBody":"json","jsonBody":"={{ JSON.stringify($json) }}","options":{}},"type":"n8n-nodes-base.httpRequest","typeVersion":4.5,"position":[448,16],"id":"00ad7e5f-5f76-4cf8-a662-d1cf42f28056","name":"HTTP Request"},{"parameters":{"rules":{"values":[{"conditions":{"options":{"caseSensitive":true,"leftValue":"","typeValidation":"strict","version":4},"conditions":[{"leftValue":"={{ !!$json.video_source_id }}","rightValue":"","operator":{"type":"boolean","operation":"true","singleValue":true},"id":"ff87fe55-dabf-49cc-b1c2-e64ef347c581"}],"combinator":"and"}}]},"options":{}},"type":"n8n-nodes-base.switch","typeVersion":3.5,"position":[1120,16],"id":"53d79ddf-1184-4830-a20a-7949f00d1ef4","name":"Switch"},{"parameters":{"authentication":"n8nUserAuth","formTitle":"CCTV Investigation Case Intake","formDescription":"Enter a case narrative and its jurisdiction map. The workflow extracts vehicle clues locally with Ollama. Upload only synthetic or public footage separately; no facial identification is used.","formFields":{"values":[{"fieldLabel":"Case ID","fieldName":"case_id","requiredField":true},{"fieldLabel":"Case description","fieldType":"textarea","fieldName":"description","requiredField":true},{"fieldLabel":"Initial jurisdiction","fieldName":"initial_zone","requiredField":true},{"fieldLabel":"Jurisdiction adjacency map (JSON)","fieldType":"textarea","fieldName":"neighbors_json","placeholder":"{\"North\":[\"East\",\"West\"],\"East\":[\"North\",\"South\"],\"West\":[\"North\",\"South\"]}","requiredField":true}]},"responseMode":"lastNode","options":{"path":"cctv-investigation-intake"}},"type":"n8n-nodes-base.formTrigger","typeVersion":2.6,"position":[416,240],"id":"39450df8-dd95-4d99-9ba8-54adc967e2c2","name":"On form submission","webhookId":"2be4f6d6-4ca9-48d0-a3fa-800748b9799e"},{"parameters":{"jsCode":"const input = $input.first().json;\nconst case_id = String(input.case_id ?? '').trim();\nconst description = String(input.description ?? '').trim();\nconst initial_zone = String(input.initial_zone ?? '').trim();\nlet neighbors;\ntry { neighbors = JSON.parse(input.neighbors_json ?? ''); } catch { throw new Error('Jurisdiction adjacency map must be valid JSON.'); }\nif (!case_id || description.length < 3 || !initial_zone) throw new Error('Case ID, case description, and initial jurisdiction are required.');\nif (!neighbors || typeof neighbors !== 'object' || Array.isArray(neighbors)) throw new Error('Jurisdiction adjacency map must be a JSON object.');\nif (!Object.values(neighbors).every((zones) => Array.isArray(zones) && zones.every((zone) => typeof zone === 'string' && zone.trim()))) throw new Error('Each jurisdiction in the map must have an array of named neighboring jurisdictions.');\nconst adjacent = [...new Set((neighbors[initial_zone] || []).map((zone) => zone.trim()).filter((zone) => zone && zone !== initial_zone))];\nif (adjacent.length < 2) throw new Error('The initial jurisdiction needs at least two distinct neighboring jurisdictions for the three-zone review.');\nreturn [{ json: { case_id, description, initial_zone, neighbors } }];"},"type":"n8n-nodes-base.code","typeVersion":2,"position":[640,240],"id":"2110a982-3c2d-4f50-af27-3c1c1824c06d","name":"Validate Case Intake"}],"connections":{"When clicking ‘Execute workflow’":{"main":[[{"node":"Police Case Input","type":"main","index":0}]]},"Police Case Input":{"main":[[{"node":"HTTP Request","type":"main","index":0}]]},"Investigation Planner (demo)":{"main":[[{"node":"Zone Review Queue (demo)","type":"main","index":0}]]},"Zone Review Queue (demo)":{"main":[[{"node":"Switch","type":"main","index":0}]]},"Schedule Trigger":{"main":[[{"node":"List Ready Follow-ups","type":"main","index":0}]]},"Split Out":{"main":[[{"node":"Analyze Follow-up Zone","type":"main","index":0}]]},"List Ready Follow-ups":{"main":[[{"node":"Split Out","type":"main","index":0}]]},"HTTP Request":{"main":[[{"node":"Investigation Planner (demo)","type":"main","index":0}]]},"Switch":{"main":[[{"node":"Local Video API (backend required)","type":"main","index":0}]]},"Validate Case Intake":{"main":[[{"node":"HTTP Request","type":"main","index":0}]]},"On form submission":{"main":[[{"node":"Validate Case Intake","type":"main","index":0}]]}},"settings":{"executionOrder":"v1","binaryMode":"separate"},"staticData":null,"meta":null,"nodeGroups":[],"pinData":{},"versionId":"dd5c5634-689d-434a-8a21-b1fa6de4c6ed","activeVersionId":null,"versionCounter":98,"triggerCount":0,"sourceWorkflowId":null,"tags":[],"shared":[{"updatedAt":"2026-11-21T17:16:56.186Z","createdAt":"2026-11-21T17:16:56.186Z","role":"workflow:owner","workflowId":"zrdrZ9NZeWe0u8bM","projectId":"6APsoM77mghiFClF","project":{"updatedAt":"2026-11-21T17:05:19.418Z","createdAt":"2026-11-21T17:02:35.010Z","id":"6APsoM77mghiFClF","name":"Mohit S <mohitsivakumar8@gmail.com>","type":"personal","icon":null,"description":null,"customTelemetryTags":[],"creatorId":"7965740b-07e3-49e2-843e-af40e412634d"}}],"versionMetadata":{"name":null,"description":null}}]
+{
+  "updatedAt": "2026-11-23T05:17:10.550Z",
+  "createdAt": "2026-11-21T17:16:56.184Z",
+  "id": "zrdrZ9NZeWe0u8bM",
+  "name": "CCTV Investigation Orchestrator — Demo",
+  "description": null,
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        96
+      ],
+      "id": "6780b274-f5be-43b4-9752-3063959ff174",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c7c023be-9fbd-4422-9aed-fd9d62f92b89",
+              "name": "case_id",
+              "value": "DEMO-001",
+              "type": "string"
+            },
+            {
+              "id": "409e790b-40d7-4fc3-b7c6-ce70f938f26e",
+              "name": "description",
+              "value": "SYNTHETIC DEMO — person wearing a navy jacket and carrying a red backpack near North Gate at 10:15; review visible non-face attributes only.",
+              "type": "string"
+            },
+            {
+              "id": "60753740-ab5e-4851-adbc-8313b385137e",
+              "name": "initial_zone",
+              "value": "North",
+              "type": "string"
+            },
+            {
+              "id": "b4c2f1e2-3f91-4ca7-aa06-e68196e66314",
+              "name": "neighbors",
+              "value": "{\"South\":[\"East\",\"West\"],\"North\":[\"East\",\"West\"],\"East\":[\"North\",\"South\"],\"West\":[\"North\",\"South\"]}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        224,
+        96
+      ],
+      "id": "3aea2846-7a93-48ac-ad52-3dc573923572",
+      "name": "Police Case Input"
+    },
+    {
+      "parameters": {
+        "jsCode": "const c = $input.first().json;\nconst neighborMap = c.neighbors || {};\nconst directions = ['North', 'East', 'South', 'West'];\nif (!directions.every((zone) => Array.isArray(neighborMap[zone]))) {\n  throw new Error('The four-direction search requires North, East, South, and West in the jurisdiction map.');\n}\nconst zones = directions;\nreturn [{ json: { ...c, investigation_plan: {\n  mode: 'synthetic_demo_only',\n  evidence_scope: 'people and common vehicles/objects; visible non-face attributes; human review required',\n  human_review_required: true,\n  zones_to_review: zones,\n  workers: zones.map((zone) => ({ worker_id: `zone_worker_${zone.toLowerCase()}`, jurisdiction: zone, status: 'awaiting_video_backend', candidate_sightings: [] })),\n  follow_up_zones: zones.filter((zone) => zone !== c.initial_zone),\n  sha256_integrity: 'computed_by_local_backend_when_evidence_is_attached'\n} } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        16
+      ],
+      "id": "f4dc2895-5581-4f68-baef-a23f6a4e170e",
+      "name": "Investigation Planner (demo)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const c = $input.first().json;\nconst plan = c.investigation_plan;\nconst videosByZone = new Map();\nfor (const video of c.registered_videos || []) {\n  if (!videosByZone.has(video.jurisdiction)) videosByZone.set(video.jurisdiction, []);\n  videosByZone.get(video.jurisdiction).push(video);\n}\nreturn plan.workers.flatMap((worker) => {\n  const zoneNeighbors = c.neighbors?.[worker.jurisdiction] || [];\n  const videos = videosByZone.get(worker.jurisdiction) || [];\n  const assignments = videos.length ? videos : [null];\n  return assignments.map((video) => ({ json: {\n    case_id: c.case_id,\n    worker_id: worker.worker_id,\n    jurisdiction: worker.jurisdiction,\n    status: video ? 'ready_for_analysis' : 'awaiting_local_video',\n    video_source_id: video?.video_source_id || null,\n    camera_id: video?.camera_id || null,\n    video_recorded_at: video?.recorded_at || null,\n    video_sha256: video?.sha256 || null,\n    description: c.description,\n    clue: c.clue || null,\n    neighbors: zoneNeighbors,\n    analysis_request: { description: c.description, clue: c.clue || null, attributes_only: true, exclude_face_identification: true },\n    candidate_sightings: [],\n    evidence_sha256: null,\n    human_review: { required: true, status: 'pending' },\n    follow_up_of: worker.jurisdiction === c.initial_zone ? null : c.initial_zone\n  } }));\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        16
+      ],
+      "id": "1d6404fa-10e7-495c-9364-3caf9f26a5b0",
+      "name": "Zone Review Queue (demo)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/zones/analyze",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1344,
+        96
+      ],
+      "id": "39a99df6-c38e-4d94-8b7b-72352b240aa8",
+      "name": "Local Video API (backend required)"
+    },
+    {
+      "parameters": {
+        "content": "## Four-direction workflow update — 2026-11-23\nFour zone workers: North, East, South, West. Each registered clip is assigned to its jurisdiction worker.\nPeople, bicycles, cars, motorcycles, buses, trucks; visible non-face clues only.\nPerson candidates require human confirmation before neighboring-zone follow-up.\nNo face recognition, identity matching, or plate OCR. No detections without registered clips.\nGPU inference and real four-feed test still require setup and clip metadata.",
+        "height": 336
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        288,
+        -640
+      ],
+      "typeVersion": 1,
+      "id": "0213d599-0589-4de5-9ebb-bf5cc2dbaec8",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        -208
+      ],
+      "id": "606bd02f-b57a-4d15-893b-7e2fa945affe",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "items",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        -208
+      ],
+      "id": "adb8bc64-2c17-4282-8ad5-e7af1c49be15",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "url": "http://host.docker.internal:8000/api/v1/followups/ready",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        -208
+      ],
+      "id": "9d92b5d9-c090-42fc-b159-6cb37b602fea",
+      "name": "List Ready Follow-ups"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=  {{ 'http://host.docker.internal:8000' + $json.analysis_url }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        672,
+        -208
+      ],
+      "id": "b0bed00a-67d7-4ef5-8d52-b01a8549b696",
+      "name": "Analyze Follow-up Zone"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/investigations/start",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        448,
+        16
+      ],
+      "id": "00ad7e5f-5f76-4cf8-a662-d1cf42f28056",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 4
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.items.some((item) => !!item.video_source_id) }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    },
+                    "id": "ff87fe55-dabf-49cc-b1c2-e64ef347c581"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.5,
+      "position": [
+        1120,
+        16
+      ],
+      "id": "53d79ddf-1184-4830-a20a-7949f00d1ef4",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "authentication": "n8nUserAuth",
+        "formTitle": "CCTV Investigation Case Intake",
+        "formDescription": "Describe a visual clue in plain language. Search covers four directional jurisdictions: North, East, South, and West. Use visible non-face attributes; a human reviews candidate clips.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Case ID",
+              "fieldName": "case_id",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Case description",
+              "fieldType": "textarea",
+              "fieldName": "description",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Initial jurisdiction",
+              "fieldName": "initial_zone",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Jurisdiction adjacency map (JSON)",
+              "fieldType": "textarea",
+              "fieldName": "neighbors_json",
+              "placeholder": "{\"South\":[\"East\",\"West\"],\"North\":[\"East\",\"West\"],\"East\":[\"North\",\"South\"],\"West\":[\"North\",\"South\"]}",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {
+          "path": "cctv-investigation-intake"
+        }
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        416,
+        240
+      ],
+      "id": "39450df8-dd95-4d99-9ba8-54adc967e2c2",
+      "name": "On form submission",
+      "webhookId": "2be4f6d6-4ca9-48d0-a3fa-800748b9799e"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst case_id = String(input.case_id ?? '').trim();\nconst description = String(input.description ?? '').trim();\nconst initial_zone = String(input.initial_zone ?? '').trim();\nlet neighbors;\ntry { neighbors = JSON.parse(input.neighbors_json ?? ''); } catch { throw new Error('Jurisdiction adjacency map must be valid JSON.'); }\nif (!case_id || description.length < 3 || !initial_zone) throw new Error('Case ID, case description, and initial jurisdiction are required.');\nif (!neighbors || typeof neighbors !== 'object' || Array.isArray(neighbors)) throw new Error('Jurisdiction adjacency map must be a JSON object.');\nif (!Object.values(neighbors).every((zones) => Array.isArray(zones) && zones.every((zone) => typeof zone === 'string' && zone.trim()))) throw new Error('Each jurisdiction in the map must have an array of named neighboring jurisdictions.');\nconst directions = ['North', 'East', 'South', 'West'];\nif (!directions.every((zone) => Array.isArray(neighbors[zone]))) throw new Error('Define all four jurisdictions: North, East, South, and West.');\nif (!directions.includes(initial_zone)) throw new Error('Initial jurisdiction must be North, East, South, or West.');\nreturn [{ json: { case_id, description, initial_zone, neighbors } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        240
+      ],
+      "id": "2110a982-3c2d-4f50-af27-3c1c1824c06d",
+      "name": "Validate Case Intake"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map((entry) => entry.json);\nif (!items.length) throw new Error('No directional work items were produced.');\nreturn [{ json: { case_id: items[0].case_id, items } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        16
+      ],
+      "id": "f6fb588c-ea39-49e2-b970-38b3f503113e",
+      "name": "Aggregate Zone Work Items"
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Police Case Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Police Case Input": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Investigation Planner (demo)": {
+      "main": [
+        [
+          {
+            "node": "Zone Review Queue (demo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zone Review Queue (demo)": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Zone Work Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "List Ready Follow-ups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "Analyze Follow-up Zone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Ready Follow-ups": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Investigation Planner (demo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Local Video API (backend required)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Case Intake": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Validate Case Intake",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Zone Work Items": {
+      "main": [
+        {
+          "node": "Switch",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "staticData": null,
+  "meta": null,
+  "nodeGroups": [],
+  "pinData": {},
+  "versionId": "dd5c5634-689d-434a-8a21-b1fa6de4c6ed",
+  "activeVersionId": null,
+  "versionCounter": 98,
+  "triggerCount": 0,
+  "sourceWorkflowId": null,
+  "tags": [],
+  "shared": [
+    {
+      "updatedAt": "2026-11-21T17:16:56.186Z",
+      "createdAt": "2026-11-21T17:16:56.186Z",
+      "role": "workflow:owner",
+      "workflowId": "zrdrZ9NZeWe0u8bM",
+      "projectId": "6APsoM77mghiFClF",
+      "project": {
+        "updatedAt": "2026-11-21T17:05:19.418Z",
+        "createdAt": "2026-11-21T17:02:35.01Z",
+        "id": "6APsoM77mghiFClF",
+        "name": "Mohit S <mohitsivakumar8@gmail.com>",
+        "type": "personal",
+        "icon": null,
+        "description": null,
+        "customTelemetryTags": [],
+        "creatorId": "7965740b-07e3-49e2-843e-af40e412634d"
+      }
+    }
+  ],
+  "versionMetadata": {
+    "name": null,
+    "description": null
+  }
+}

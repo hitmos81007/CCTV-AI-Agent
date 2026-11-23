@@ -75,6 +75,9 @@ def initialize() -> None:
                 track_id INTEGER,
                 vehicle_type TEXT NOT NULL,
                 vehicle_color TEXT,
+                subject_type TEXT NOT NULL DEFAULT 'vehicle',
+                visual_attributes_json TEXT NOT NULL DEFAULT '[]',
+                integrity_version INTEGER NOT NULL DEFAULT 1,
                 detector_confidence REAL NOT NULL,
                 clue_match_score REAL,
                 evidence_sha256 TEXT NOT NULL,
@@ -109,6 +112,13 @@ def initialize() -> None:
         columns = {row["name"] for row in db.execute("PRAGMA table_info(videos)").fetchall()}
         if "duration_seconds" not in columns:
             db.execute("ALTER TABLE videos ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 0")
+        sighting_columns = {row["name"] for row in db.execute("PRAGMA table_info(sightings)").fetchall()}
+        if "subject_type" not in sighting_columns:
+            db.execute("ALTER TABLE sightings ADD COLUMN subject_type TEXT NOT NULL DEFAULT 'vehicle'")
+        if "visual_attributes_json" not in sighting_columns:
+            db.execute("ALTER TABLE sightings ADD COLUMN visual_attributes_json TEXT NOT NULL DEFAULT '[]'")
+        if "integrity_version" not in sighting_columns:
+            db.execute("ALTER TABLE sightings ADD COLUMN integrity_version INTEGER NOT NULL DEFAULT 1")
 
 
 def audit(db: sqlite3.Connection, event_type: str, payload: Any) -> str:
