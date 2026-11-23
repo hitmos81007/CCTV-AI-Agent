@@ -167,7 +167,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "=  {{ 'http://host.docker.internal:8000' + $json.analysis_url }}",
+        "url": "={{ 'http://host.docker.internal:8000' + $json.analysis_url }}",
         "options": {}
       },
       "type": "n8n-nodes-base.httpRequest",
@@ -481,4 +481,4 @@
     "name": null,
     "description": null
   }
-}
+}\n

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +22,23 @@ FOUR_ZONE_MAP = {
     "South": ["West", "East"],
     "East": ["North", "South"],
 }
+
+
+class N8nWorkflowExportTests(unittest.TestCase):
+    def test_scheduled_followup_nodes_are_connected_with_valid_dynamic_url_expression(self):
+        project_root = Path(__file__).resolve().parents[1]
+        for name in ("CCTV-Investigation-Orchestrator.json", "CCTV-Investigation-Orchestrator-Import.json"):
+            with self.subTest(workflow=name):
+                workflow = json.loads((project_root / "n8n" / name).read_text(encoding="utf-8-sig"))
+                nodes = {node["name"]: node for node in workflow["nodes"]}
+                connections = workflow["connections"]
+                self.assertEqual(connections["Schedule Trigger"]["main"][0][0]["node"], "List Ready Follow-ups")
+                self.assertEqual(connections["List Ready Follow-ups"]["main"][0][0]["node"], "Split Out")
+                self.assertEqual(connections["Split Out"]["main"][0][0]["node"], "Analyze Follow-up Zone")
+                self.assertEqual(
+                    nodes["Analyze Follow-up Zone"]["parameters"]["url"],
+                    "={{ 'http://host.docker.internal:8000' + $json.analysis_url }}",
+                )
 
 
 class VideoDeviceSelectionTests(unittest.TestCase):
