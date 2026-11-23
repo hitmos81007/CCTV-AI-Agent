@@ -355,6 +355,13 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(ready.status_code, 200)
         self.assertEqual(ready.json()["count"], 2)
         self.assertEqual({item["jurisdiction"] for item in ready.json()["items"]}, {"East", "West"})
+        with patch("app.main.analyze_zone", return_value={"candidate_sightings": [], "follow_up_jobs": []}) as analyze:
+            dispatched = self.client.post(ready.json()["items"][0]["analysis_url"])
+        self.assertEqual(dispatched.status_code, 200)
+        self.assertEqual(dispatched.json()["candidate_sightings"], [])
+        analyze.assert_called_once()
+        followups = self.client.get("/api/v1/followups?case_id=SYNTH-CASE-1").json()
+        self.assertEqual(sum(job["status"] == "completed" for job in followups), 1)
         sightings = self.client.get("/api/v1/sightings?case_id=SYNTH-CASE-1&review_status=confirmed_candidate")
         self.assertEqual(sightings.status_code, 200)
         self.assertEqual(sightings.json()[0]["subject_type"], "person")
