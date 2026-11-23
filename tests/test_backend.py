@@ -41,6 +41,14 @@ class N8nWorkflowExportTests(unittest.TestCase):
                 )
 
 
+class WindowsLauncherTests(unittest.TestCase):
+    def test_gpu_launcher_loads_reviewer_and_ollama_environment_file(self):
+        project_root = Path(__file__).resolve().parents[1]
+        launcher = (project_root / "run_backend_gpu.ps1").read_text(encoding="utf-8")
+        self.assertIn("Copy-Item -LiteralPath '.env.example' -Destination '.env'", launcher)
+        self.assertIn("--env-file .env", launcher)
+
+
 class VideoDeviceSelectionTests(unittest.TestCase):
     def test_auto_uses_gpu_when_available_and_cpu_otherwise(self):
         self.assertEqual(_resolve_device("auto", cuda_available=True), 0)

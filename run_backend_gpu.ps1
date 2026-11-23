@@ -15,13 +15,16 @@ if (-not (Test-Path -LiteralPath (Join-Path $packageTarget 'torch'))) {
 }
 
 Set-Location -LiteralPath $projectRoot
+if (-not (Test-Path -LiteralPath '.env')) {
+    Copy-Item -LiteralPath '.env.example' -Destination '.env'
+}
 $env:PYTHONHOME = $pythonHome
 $env:PYTHONPATH = "$packageTarget;$projectRoot"
 if (-not $env:APP_DATA_DIR) {
     $env:APP_DATA_DIR = Join-Path $projectRoot 'data'
 }
 $env:YOLO_DEVICE = $Device
-& $pythonPath -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+& $pythonPath -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --env-file .env
 if ($LASTEXITCODE -ne 0) {
     throw 'FastAPI exited with an error.'
 }
