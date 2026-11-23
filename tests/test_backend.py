@@ -47,6 +47,14 @@ class WindowsLauncherTests(unittest.TestCase):
         launcher = (project_root / "run_backend_gpu.ps1").read_text(encoding="utf-8")
         self.assertIn("Copy-Item -LiteralPath '.env.example' -Destination '.env'", launcher)
         self.assertIn("--env-file .env", launcher)
+        self.assertIn("$audioPackageTarget;$packageTarget;$projectRoot", launcher)
+
+    def test_optional_audio_setup_uses_audio_requirements_and_pyav_compatibility_pin(self):
+        project_root = Path(__file__).resolve().parents[1]
+        setup = (project_root / "setup_audio.ps1").read_text(encoding="utf-8")
+        audio_requirements = (project_root / "requirements-audio.txt").read_text(encoding="utf-8")
+        self.assertIn("requirements-audio.txt", setup)
+        self.assertIn("av<19", audio_requirements)
 
 
 class VideoDeviceSelectionTests(unittest.TestCase):

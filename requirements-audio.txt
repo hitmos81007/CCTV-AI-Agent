@@ -1,2 +1,4 @@
 # Optional offline voice-to-text support for spoken case clues.
 faster-whisper>=1.1
+# Faster-Whisper currently passes metadata_errors to av.open(); PyAV 19 removed it.
+av<19
