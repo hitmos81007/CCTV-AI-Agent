@@ -73,6 +73,18 @@ FastAPI runs on Windows and stores evidence locally. The n8n workflow dispatches
 
 6. Voice transcription is optional. Run `./setup_audio.ps1` and then `./run_backend_gpu.ps1`. The first use downloads the selected Faster-Whisper model; later transcription runs locally. Configure `WHISPER_MODEL` and `WHISPER_DEVICE` in `.env` as needed.
 
+## Vercel-hosted interface
+
+The optional `frontend/` project builds the review interface for Vercel. Vercel hosts only the static web page; FastAPI, Ollama, n8n, video inference, and evidence storage remain on the backend host.
+
+1. Import this repository into Vercel and set the project root to `frontend/`, the build command to `npm run build`, and the output directory to `dist`.
+2. Set the Vercel build environment variable `VITE_API_BASE_URL` to the backend's HTTPS origin, such as `https://api.example.org`.
+3. Set `CORS_ALLOWED_ORIGINS` in the backend `.env` to the exact Vercel site origin, such as `https://cctv-review.example.org`. Restart FastAPI after changing it.
+4. Set strong `REVIEW_USERNAME` and `REVIEW_PASSWORD` values on the backend. When `CORS_ALLOWED_ORIGINS` is set, HTTP Basic authentication is required across the API; the browser sends credentials directly to FastAPI over HTTPS. Browser uploads go directly from the user's browser to FastAPI, so large clips do not pass through Vercel Functions.
+5. For n8n, create an HTTP Basic Auth credential with the same backend account and assign it to each HTTP Request node in the imported workflow. Keep n8n private; do not put backend credentials in the frontend build settings or workflow export.
+
+The backend must be reachable from the user's browser; a Windows `localhost` or Docker-only address cannot serve a public Vercel site. Use a protected HTTPS gateway or a private network connection. The backend stores evidence and SQLite data on its host, and HTTP Basic provides a shared reviewer account rather than individual user roles. Keep the backend on a private network until deployment access controls, durable protected storage, and retention policies are configured. Do not use real case footage on a public demo. The Vercel frontend does not make the local processing services public by itself. Leaving `CORS_ALLOWED_ORIGINS` blank preserves the local-only behavior and does not enable hosted access.
+
 ### Connecting Docker n8n to Windows
 
 The included workflow calls the host API at `host.docker.internal:8000`. Docker access requires a non-loopback listener; enable it explicitly:

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#f4f7fa">
   <title>CCTV Case Search &amp; Review</title>
+  <script src="/api-config.js"></script>
   <style>
     :root { color-scheme:light; --ink:#17233d; --muted:#53627a; --line:#d8dfed; --paper:#fff; --wash:#f4f6fc; --blue:#344bd1; --blue-strong:#2639a9; --teal:#087e78; --green-bg:#e9f8f4; --amber:#9a5b08; --amber-bg:#fff4df; --red:#a52d46; --purple:#7653d6; --shadow:0 12px 34px rgba(37,50,106,.09); }
     * { box-sizing:border-box; }
@@ -150,10 +151,10 @@
       <label>What should the search look for?<textarea id="case-description" maxlength="4000" placeholder="Example: a person in a navy jacket carrying a red backpack near the north gate around 10:15."></textarea></label>
     </div>
     <div class="clue-starters" aria-label="Example clue starters"><span>Start with a clue:</span><button type="button" class="chip" data-clue="A person in a dark jacket carrying a bright backpack near the entrance.">🧥 Person + bag</button><button type="button" class="chip" data-clue="A light-colored car with no visible license plate, traveling east near the junction.">🚗 Car without plate</button><button type="button" class="chip" data-clue="A bicycle with a large basket and a blue frame near the market road.">🚲 Bicycle details</button></div>
-    <div class="button-row"><button id="create-case" class="primary">Create case &amp; parse clue locally</button><span id="case-status" class="status" role="status" aria-live="polite"></span></div>
+    <div class="button-row"><button id="create-case" class="primary">Create case &amp; parse clue</button><span id="case-status" class="status" role="status" aria-live="polite"></span></div>
     <div id="case-summary" class="case-summary" aria-live="polite"></div>
     <div class="audio-tools">
-      <label>Or choose an audio recording<input id="clue-audio" type="file" accept="audio/*,.m4a,.wav,.mp3,.webm,.flac"><span class="field-note">Local transcription only; the audio is deleted after transcription.</span></label>
+      <label>Or choose an audio recording<input id="clue-audio" type="file" accept="audio/*,.m4a,.wav,.mp3,.webm,.flac"><span class="field-note">Transcription runs on the connected backend; the temporary audio upload is deleted afterward.</span></label>
       <button id="transcribe-clue" class="quiet">Transcribe locally</button>
       <button id="use-transcript" class="secondary">Use transcript as clue</button>
     </div>
@@ -162,7 +163,7 @@
   </section>
 
   <section id="feeds-panel" class="panel" aria-labelledby="feeds-title">
-    <div class="panel-head"><div><h2 id="feeds-title">Add camera footage</h2><p class="sub">Upload synthetic or public clips. For each clip, enter its camera ID and the recording start time shown by that camera. Files are stored on this computer.</p></div><span class="step-tag">Step 2</span></div>
+    <div class="panel-head"><div><h2 id="feeds-title">Add camera footage</h2><p class="sub">Upload synthetic or public clips. For each clip, enter its camera ID and the recording start time shown by that camera. Files are sent directly to the connected backend.</p></div><span class="step-tag">Step 2</span></div>
     <p id="active-case-label" class="status">Create a case to enable feed upload.</p>
     <div class="zone-grid">
       <div class="zone-card" data-zone="North"><div class="zone-title"><h3><span class="zone-badge">↑</span>North</h3><span class="zone-direction">Direction</span></div><label>Camera ID<input class="camera-id" maxlength="80" placeholder="e.g. CAM-N-01"></label><label>Recording date and time<input class="recorded-at" type="datetime-local"></label><label>Video clip<input class="clip-file" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,.m4v"></label><p class="zone-state" aria-live="polite"></p></div>
@@ -193,7 +194,9 @@ const items = document.getElementById("items");
 const count = document.getElementById("count");
 let currentCaseId = "";
 function el(tag,text,className){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;}
-async function api(url,options){const response=await fetch(url,options);let body={};try{body=await response.json();}catch{}if(!response.ok)throw new Error(body.detail||("Request failed ("+response.status+")"));return body;}
+const API_BASE_URL=(window.CCTV_API_BASE_URL||"").replace(/\/+$/,"");
+function apiUrl(path){return new URL(path,API_BASE_URL||location.origin).toString();}
+async function api(url,options){const response=await fetch(apiUrl(url),{credentials:"include",...options});let body={};try{body=await response.json();}catch{}if(!response.ok)throw new Error(body.detail||("Request failed ("+response.status+")"));return body;}
 function setWorkflowStatus(text){document.getElementById("workflow-status").textContent=text;}
 function setStage(stage){document.querySelectorAll(".steps .step").forEach((step,index)=>{step.classList.toggle("active",index+1===stage);step.classList.toggle("done",index+1<stage);});document.getElementById("progress-fill").style.width=(stage*25)+"%";}
 function setCaseEnabled(enabled){document.getElementById("upload-clips").disabled=!enabled;document.getElementById("run-search").disabled=!enabled;document.getElementById("active-case-label").textContent=enabled?"Active case: "+currentCaseId:"Create a case to enable feed upload.";}
@@ -222,7 +225,7 @@ document.getElementById("create-case").addEventListener("click",async()=>{
     if(parsed.event_time_text)summary.append(el("div","Approximate time from clue: "+parsed.event_time_text));
     summary.append(el("div","Starting direction: "+result.initial_zone+" · Four direction workers ready"));
     summary.classList.add("visible");
-    setCaseEnabled(true);setStage(2);status.textContent="Case saved locally. Check the parsed clue above, then add camera feeds.";
+    setCaseEnabled(true);setStage(2);status.textContent="Case saved on the backend. Check the parsed clue above, then add camera feeds.";
     setWorkflowStatus("Case ready. Add synthetic or public footage to the directions you want to search.");
   }catch(error){status.textContent="Case was not created: "+error.message;}
   finally{button.disabled=false;}
@@ -231,7 +234,7 @@ document.getElementById("transcribe-clue").addEventListener("click",async()=>{
   const file=document.getElementById("clue-audio").files[0];
   const status=document.getElementById("transcript-status");
   if(!file){status.textContent="Choose a short audio recording first.";return;}
-  const button=document.getElementById("transcribe-clue");button.disabled=true;status.textContent="Transcribing on this computer…";
+  const button=document.getElementById("transcribe-clue");button.disabled=true;status.textContent="Transcribing on the connected backend…";
   const body=new FormData();body.append("file",file,file.name);
   try{const result=await api("/api/v1/clues/transcribe",{method:"POST",body});document.getElementById("case-description").value=result.transcript;status.textContent="Transcript ready. Review it in the clue box, then create the case.";}
   catch(error){status.textContent="Local transcription unavailable: "+error.message;}
@@ -296,7 +299,7 @@ async function refresh(){
   items.replaceChildren(el("div","Loading review records…","empty"));
   const caseId=document.getElementById("case-filter").value.trim();
   document.getElementById("metric-case").textContent=caseId.length>12?caseId.slice(0,10)+"…":(caseId||"All cases");
-  const url=new URL("/api/v1/sightings",location.origin);if(caseId)url.searchParams.set("case_id",caseId);const reviewStatus=document.getElementById("review-filter").value;if(reviewStatus)url.searchParams.set("review_status",reviewStatus);
+  const url=new URL("/api/v1/sightings",API_BASE_URL||location.origin);if(caseId)url.searchParams.set("case_id",caseId);const reviewStatus=document.getElementById("review-filter").value;if(reviewStatus)url.searchParams.set("review_status",reviewStatus);
   try{
     const allRecords=await api(url.toString());const direction=document.getElementById("zone-filter").value;const records=direction?allRecords.filter(record=>record.jurisdiction===direction):allRecords;
     count.textContent=records.length+" candidate record"+(records.length===1?"":"s");
@@ -310,7 +313,7 @@ async function refresh(){
       const targetType=record.subject_type||record.vehicle_type;
       card.append(el("h3",(record.vehicle_color?record.vehicle_color+" ":"")+targetType+" · "+record.jurisdiction,"record-title"));
       const grid=el("div",undefined,"record-grid");
-      const video=document.createElement("video");video.controls=true;video.preload="metadata";video.src="/api/v1/videos/"+encodeURIComponent(record.video_source_id)+"/file#t="+(Number(record.video_offset_seconds)||0);
+      const video=document.createElement("video");video.controls=true;video.preload="metadata";video.crossOrigin="use-credentials";video.src=apiUrl("/api/v1/videos/"+encodeURIComponent(record.video_source_id)+"/file")+"#t="+(Number(record.video_offset_seconds)||0);
       const info=el("div");
       const meta=el("div",undefined,"record-meta");
       for(const pair of [["Case",record.case_id],["Camera",record.camera_id],["Timestamp",record.occurred_at],["Confidence",Number(record.detector_confidence).toFixed(3)],["Clue comparison",record.clue_match_score==null?"not scored":Number(record.clue_match_score).toFixed(2)],["Review status",record.review_status]]){
@@ -342,7 +345,7 @@ async function refresh(){
 }
 async function refreshFollowups(caseId,direction){
   const panel=document.getElementById("followups");panel.replaceChildren(el("div","Loading neighboring searches…","empty"));
-  const url=new URL("/api/v1/followups",location.origin);if(caseId)url.searchParams.set("case_id",caseId);
+  const url=new URL("/api/v1/followups",API_BASE_URL||location.origin);if(caseId)url.searchParams.set("case_id",caseId);
   try{
     const result=await api(url.toString());const jobs=direction?result.filter(job=>job.target_zone===direction):result;
     document.getElementById("followup-count").textContent=jobs.length+" job"+(jobs.length===1?"":"s");panel.replaceChildren();

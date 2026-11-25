@@ -18,6 +18,7 @@ import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
 from .ollama_client import OLLAMA_BASE_URL, OLLAMA_MODEL, parse_vehicle_clues
@@ -26,6 +27,15 @@ from .video_analysis import analyze_video
 
 
 app = FastAPI(title="CCTV Investigation Agent Local API", version="0.1.0")
+cors_origins = [origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "1024")) * 1024 * 1024
 FOLLOWUP_THRESHOLD = float(os.getenv("FOLLOWUP_MATCH_THRESHOLD", "0.70"))
 VIDEO_WORKER_CONCURRENCY = max(1, min(4, int(os.getenv("VIDEO_WORKER_CONCURRENCY", "1"))))
@@ -46,6 +56,13 @@ def require_reviewer(credentials: HTTPBasicCredentials | None = Depends(review_a
     if not (username_ok and password_ok):
         raise HTTPException(status_code=401, detail="Invalid reviewer credentials", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
+
+
+def require_api_access(credentials: HTTPBasicCredentials | None = Depends(review_auth)) -> str:
+    """Require reviewer auth when the API is configured for a hosted frontend."""
+    if not cors_origins:
+        return "local"
+    return require_reviewer(credentials)
 
 
 @lru_cache(maxsize=1)
@@ -214,8 +231,13 @@ def review_home(_: str = Depends(require_reviewer)):
     return FileResponse(Path(__file__).parent / "static" / "review.html")
 
 
+@app.get("/api-config.js", include_in_schema=False)
+def api_config(_: str = Depends(require_reviewer)):
+    return FileResponse(Path(__file__).parent / "static" / "api-config.js", media_type="application/javascript")
+
+
 @app.get("/health")
-async def health():
+async def health(_: str = Depends(require_api_access)):
     db.initialize()
     try:
         async with httpx.AsyncClient(timeout=2) as client:
@@ -238,7 +260,7 @@ async def health():
 
 
 @app.post("/api/v1/investigations/start", status_code=201)
-async def start_investigation(request: CaseCreate):
+async def start_investigation(request: CaseCreate, _: str = Depends(require_api_access)):
     """Create/reuse a matching case and extract visible-target clues with local Ollama."""
     db.initialize()
     with db.connection() as conn:
@@ -283,7 +305,7 @@ async def start_investigation(request: CaseCreate):
 
 
 @app.post("/api/v1/cases", status_code=201)
-def create_case(request: CaseCreate):
+def create_case(request: CaseCreate, _: str = Depends(require_api_access)):
     db.initialize()
     with db.connection() as conn:
         existing = conn.execute("SELECT case_id FROM cases WHERE case_id=?", (request.case_id,)).fetchone()
@@ -298,7 +320,7 @@ def create_case(request: CaseCreate):
 
 
 @app.get("/api/v1/cases")
-def list_cases():
+def list_cases(_: str = Depends(require_api_access)):
     db.initialize()
     with db.connection() as conn:
         rows = conn.execute("SELECT * FROM cases ORDER BY created_at DESC").fetchall()
@@ -306,7 +328,7 @@ def list_cases():
 
 
 @app.post("/api/v1/clues/parse")
-async def parse_clues(request: ClueParseRequest):
+async def parse_clues(request: ClueParseRequest, _: str = Depends(require_api_access)):
     db.initialize()
     with db.connection() as conn:
         case = _case_or_404(conn, request.case_id)
@@ -443,7 +465,7 @@ def list_videos(case_id: str | None = None, jurisdiction: str | None = None, _: 
 
 
 @app.post("/api/v1/work-items/resolve")
-def resolve_work_items(request: ResolveWorkItemsRequest):
+def resolve_work_items(request: ResolveWorkItemsRequest, _: str = Depends(require_api_access)):
     """Attach every locally registered clip for each allowed jurisdiction work item.
 
     Items without a clip are kept in the response with a null source ID so the
@@ -524,7 +546,7 @@ def get_video_file(video_source_id: str, _: str = Depends(require_reviewer)):
 
 
 @app.post("/api/v1/zones/analyze")
-async def analyze_zones(request: AnalyzeZonesRequest):
+async def analyze_zones(request: AnalyzeZonesRequest, _: str = Depends(require_api_access)):
     """Dispatch the four directional work items together, with a local inference limit."""
     with db.connection() as conn:
         case = _case_or_404(conn, request.case_id)
@@ -573,7 +595,7 @@ async def analyze_zones(request: AnalyzeZonesRequest):
 
 
 @app.post("/api/v1/zone/analyze")
-def analyze_zone(request: AnalyzeZoneRequest):
+def analyze_zone(request: AnalyzeZoneRequest, _: str = Depends(require_api_access)):
     db.initialize()
     with db.connection() as conn:
         case = _case_or_404(conn, request.case_id)
@@ -740,7 +762,7 @@ def list_followups(case_id: str | None = None, status: str | None = None, _: str
 
 
 @app.get("/api/v1/followups/ready")
-def ready_followups(case_id: str | None = None):
+def ready_followups(case_id: str | None = None, _: str = Depends(require_api_access)):
     """Return actual, locally registered follow-up work for n8n to fan out to zone workers."""
     db.initialize()
     query = """
@@ -774,7 +796,7 @@ def ready_followups(case_id: str | None = None):
 
 
 @app.post("/api/v1/followups/{followup_id}/analyze")
-def analyze_followup(followup_id: str):
+def analyze_followup(followup_id: str, _: str = Depends(require_api_access)):
     """Claim and analyze a follow-up only when its real local clip is registered."""
     db.initialize()
     with db.connection() as conn:
@@ -813,7 +835,7 @@ def analyze_followup(followup_id: str):
 
 
 @app.get("/api/v1/integrity")
-def integrity_status():
+def integrity_status(_: str = Depends(require_api_access)):
     db.initialize()
     invalid_files: list[str] = []
     missing_files: list[str] = []

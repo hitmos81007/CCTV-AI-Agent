@@ -1,0 +1,11 @@
+{
+  "name": "cctv-investigation-web",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}
