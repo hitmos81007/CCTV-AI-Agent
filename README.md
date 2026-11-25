@@ -1,72 +1,147 @@
-# CCTV Investigation Agent — local demo
+# CCTV Investigation Agent
 
-This is a local, human-reviewed visual-clue search workflow. It accepts a plain-language clue and searches registered clips in four directions: North, West, South, and East. Supported detector classes are people, bicycles, cars, motorcycles, buses, and trucks. Person matching is limited to broad visible type/color cues; marks, tattoos, scars, bags, and similar details are reviewer notes and are not machine-verified. The system performs no face recognition, reference-photo matching, license-plate OCR, or identity claims. A reviewer must confirm a person candidate before neighboring-zone searches. Use synthetic or public footage only.
+A local, human-reviewed video search prototype for organizing CCTV footage by camera direction and searching it with natural-language clues. The system analyzes registered clips, records timestamped candidates, and presents evidence for reviewer assessment.
 
-## Current state (2026-11-25)
+Use synthetic or publicly licensed footage for demonstrations. This project is a decision-support prototype; it does not identify people or determine guilt or enforcement outcomes.
 
-| Component | Verified state |
-|---|---|
-| Backend contract suite | The 31-test suite passed 31/31 on 2026-11-25 using the local Python 3.14 runtime. Coverage includes four-zone guarding and batch dispatch, person review-gated follow-ups and ready-job dispatch, reviewer authentication, clue parsing contracts, SHA-256/audit integrity, upload/review routes, Windows GPU launcher environment loading, loopback-by-default bind behavior, scheduled follow-up exports, and the four-zone batch branch guard. Local Whisper is mocked in tests. |
-| Four-zone batch API | `POST /api/v1/zones/analyze` accepts North/West/South/East work items, validates the case map, and leaves missing clips in `awaiting_local_video` without creating sightings. |
-| Actual detector path | PyTorch 2.14.1+cpu, OpenCV 5.1.0, and Ultralytics 8.4.216 are installed in `%USERPROFILE%\Documents\Codex\cctv-video-env`. A five-frame synthetic blank MP4 was read and passed through YOLO11n + ByteTrack; it returned zero candidate tracks, as expected. No detections were invented. |
-| Actual sample MP4 runs | Both user-supplied MP4s decode and were processed locally. The 24,961,070-byte clip produced 151 raw candidate tracks on CPU (107.1 seconds); the 90,549,639-byte clip produced 162 on CPU (172.7 seconds). These are unreviewed detector outputs, not confirmed sightings, and were not saved into the case database because camera, jurisdiction, recording time, and footage provenance were not established. |
-| H.264 upload, playback bytes, and GPU inference (2026-11-25) | An isolated synthetic H.264 clip was uploaded through the API (201), served back as `video/mp4` with identical bytes (200), and decoded by OpenCV as 12 frames at 640×360 and 5 fps. YOLO ran on the RTX 5050 and persisted two actual detector candidates with timestamps; both remain pending human review. `/api/v1/integrity` returned valid, including evidence and sighting hashes. This validates the backend video path; browser rendering of this exact clip was not verified because the in-app browser could not reach host loopback. |
-| RTX 5050 GPU | A pinned CUDA PyTorch 2.11.0+cu128 / torchvision 0.26.0+cu128 runtime was installed in `%USERPROFILE%\Documents\Codex\cctv-video-gpu-packages`; CUDA reports available on the NVIDIA GeForce RTX 5050 Laptop GPU. The 24,961,070-byte sample was processed with CUDA in 48.8 seconds and yielded 151 raw, unreviewed candidate tracks (cars 113, people 26, trucks 6, buses 6). Results were not persisted. This validates a local inference path, not a completed four-feed case. |
-| Synthetic GPU follow-up run | A separate isolated test generated three short synthetic camera clips from the public Ultralytics person-detection sample image. CUDA YOLO analysis of North produced 2 person candidates; a test-only reviewer confirmation queued East and West, and an East follow-up was analyzed with CUDA and produced 2 actual detector candidates. This exercised upload → timestamped evidence → inference → human review → dynamic neighboring-zone dispatch → follow-up inference. The temporary database and generated clips were removed; no findings were added to a retained case. |
-| Ollama and live n8n run | n8n, Ollama (`llama3.2:latest`), and FastAPI health checks returned ready. Ollama parsed the synthetic clue (person, navy, red backpack, 10:15, North). The manual workflow then sent the four registered directional feeds to actual CUDA YOLO inference. |
-| Local service recheck (2026-11-25) | FastAPI health returned `ok`, Ollama ready with `llama3.2:latest`, and CUDA ready. A live clue-parse request was handled by Ollama and returned person, dark clothing, backpack/red attribute, 08:00, and North. n8n `/healthz` returned successfully and Docker confirmed `cctv-n8n` running. The current loopback-default launcher was not used for a fresh container-to-host check; an earlier live four-direction run verified that path with the backend reachable from n8n. |
-| Four-direction n8n → GPU test | The live unpublished workflow draft completed successfully through its manual trigger. Four synthetic public-image clips (North/West/South/East, 26,393 bytes each) were processed on the RTX 5050; the API stored eight actual person-class candidates, two per direction. The source image was repeated in all four short clips, so this proves four-feed routing and inference, not realistic surveillance coverage. All candidates remain pending review; the image produced black torso-color estimates and only a partial match to the navy/red-backpack clue. No fake findings were added. |
-| Live n8n workflow | The original workflow remains untouched. In the open draft, `CCTV Investigation Orchestrator — Four Directions` (workflow ID `ZmpeTl350Tou60AR`), the Aggregate Zone Work Items → Switch wire was missing. I connected it, corrected the Switch guard to send a non-empty batch to FastAPI (which itself safely leaves missing clips waiting), and reran the workflow successfully. The manual execution is saved; the draft is still unpublished. |
-| Scheduled follow-up workflow | A manual execution of the live Schedule Trigger path previously fetched two human-approved neighboring-zone jobs, submitted both to the FastAPI follow-up endpoint, and returned actual CUDA detections in East and West. The exported workflow uses a valid dynamic URL and the saved backend requires reviewer authentication for the queue UI. |
-| Local review page | A police-facing four-step flow is implemented: create case and clue, upload clips by direction with camera/time metadata, run the search, then review timestamped candidates. It calls the FastAPI case, upload, resolve, batch-analysis, and review APIs. The colorful UI has an overview panel, clue prompts, colored direction cards, review/direction filters, voice capture/transcription, and reviewer actions. Browser QA confirmed it loads the synthetic candidates and completed East/West follow-ups; the overview now labels the list scope as “All cases” until filtered. Basic authentication requires `REVIEW_USERNAME` and `REVIEW_PASSWORD`. |
-| Voice clue | The authenticated transcription endpoint was tested on locally synthesized speech using Faster-Whisper `tiny.en`; it returned the clue text and deleted the temporary audio upload. `requirements-audio.txt` pins PyAV below 19 because PyAV 19 removed an argument Faster-Whisper uses. User-supplied speech and production noise conditions have not been tested. |
-| Follow-up search | The API queues neighboring-zone work after a person candidate is human-confirmed. Reviewers can see each queued direction and its time window; the listing endpoint requires reviewer authentication. The live n8n scheduled path was manually executed against two synthetic reviewer-approved jobs and both East and West GPU analyses completed. |
-| Integrity | SHA-256 source/evidence hashing and a hash-chained audit log are implemented. Prior isolated synthetic-case checks returned valid integrity. |
+## Capabilities
 
-The revised live n8n workflow is an unpublished draft; the previous workflow remains preserved. Test evidence is isolated under `%TEMP%\cctv-agent-live-e2e-20261123` and `%TEMP%\cctv-agent-live-e2e-20261125`; it consists only of synthetic clips based on a public sample image. The November 25 test server was stopped after verification and the isolated test data was retained separately from project case data.
+- Accept text clues and optional voice transcription. Ollama parses target type, broad color, visible-attribute notes, approximate time, and starting direction.
+- Organize footage across four directions: North, East, South, and West.
+- Analyze locally registered clips with YOLO and ByteTrack for people, bicycles, cars, motorcycles, buses, and trucks.
+- Store candidate class, camera, recording timestamp, video offset, detector confidence, review status, and evidence hash.
+- Review video candidates in a browser interface and record `confirmed_candidate`, `not_relevant`, or `needs_more_review` decisions.
+- Queue neighboring-zone work only after a person candidate is confirmed by a reviewer. Jobs wait until a matching local clip is registered.
+- Verify source clips, derived sighting hashes, and the hash-chained audit log through the integrity endpoint.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    P[Investigator] --> UI[Local review interface]
+    UI --> API[FastAPI case and video API]
+    N[n8n orchestrator] --> API
+    API --> O[Local Ollama clue parser]
+    API --> Z[North · East · South · West workers]
+    Z --> Y[YOLO and ByteTrack]
+    Y --> DB[(SQLite cases and sightings)]
+    Y --> E[(Local evidence files)]
+    DB --> R[Human review]
+    R --> F[Neighbor-zone follow-up queue]
+    F --> N
+```
+
+FastAPI runs on Windows and stores evidence locally. The n8n workflow dispatches registered zone clips to the API. Ollama parses clues locally; YOLO processes video on CPU or CUDA, depending on the installed PyTorch runtime and device setting. No cloud vision service is required by the processing path.
+
+## Requirements
+
+- Windows 10/11 and PowerShell
+- Python 3.14 for the tested CUDA/audio setup
+- Ollama with `llama3.2:latest` (or a compatible local model)
+- Docker Desktop with n8n for workflow orchestration
+- NVIDIA GPU and a compatible CUDA PyTorch build for GPU inference; CPU mode is also supported
 
 ## Windows setup
 
-Run FastAPI on Windows so it can reach Ollama at `127.0.0.1:11434` and store evidence locally. The n8n Docker container calls the host through `host.docker.internal`.
+1. Install Ollama, start it, and make sure the selected model is available:
 
-1. Install/run Ollama and confirm `llama3.2:latest` appears in `ollama list`.
-2. Copy `.env.example` to `.env`; set unique `REVIEW_USERNAME` and `REVIEW_PASSWORD` values before opening the review page.
-3. In PowerShell, enter this project folder and run `./run_backend_video.ps1`. The video packages are installed in the short-path environment `%USERPROFILE%\Documents\Codex\cctv-video-env`. The backend binds to `127.0.0.1` by default for local review. To force CPU, run `./run_backend_video.ps1 -Device cpu`.
-4. Check `http://localhost:8000/health`, then open `http://localhost:8000/` for the protected review/upload page.
-5. To enable RTX 5050 inference with the tested CUDA packages, run `./setup_gpu.ps1` once, then `./run_backend_gpu.ps1`. The script uses the local Python 3.14 runtime and a separate package directory at `%USERPROFILE%\Documents\Codex\cctv-video-gpu-packages`; confirm `/health` reports GPU readiness after launch. The CUDA inference path was tested against uploaded sample clips.
-6. Optional local voice transcription: run `./setup_audio.ps1` once, then start with `./run_backend_gpu.ps1`. The launcher detects the separate audio package folder and keeps the model cache under `data/model-cache`. The first transcription downloads the selected Faster-Whisper model; later transcription runs locally. Set `WHISPER_MODEL` and `WHISPER_DEVICE` in `.env` to change the default `base` CPU configuration. The `tiny.en` model was used in the generated-speech smoke test.
+   ```powershell
+   ollama pull llama3.2:latest
+   ollama list
+   ```
 
-For Docker n8n to call the Windows host backend at `host.docker.internal:8000`, explicitly run the launcher with `-BindAddress 0.0.0.0`. This listens on all host interfaces; first restrict inbound port 8000 in Windows Firewall to the Docker network and deny other networks. Do not expose the service publicly. Without that opt-in, the backend listens only on `127.0.0.1`. The current launcher’s all-interface option has not been retested in this session; the earlier live n8n run verified the Docker route before the launcher was changed to default to loopback. Evidence is stored in `data/evidence`; SQLite is stored under `data/` by default.
+2. In the project directory, copy `.env.example` to `.env`. Set unique `REVIEW_USERNAME` and `REVIEW_PASSWORD` values before opening the review interface.
 
-## n8n import and run
+3. Install the CPU/video environment and start the backend:
 
-1. Keep the existing n8n workflows intact. In n8n, import `n8n/CCTV-Investigation-Orchestrator-Import.json` as a new workflow.
-2. The **When clicking ‘Execute workflow’** path runs the demo case form through the four-direction planner. The backend sends only registered North/West/South/East clips to YOLO; unregistered directions stay waiting.
-3. The **On form submission** path is the case-intake entry point. The **Schedule Trigger** path polls ready follow-ups and analyzes clips attached to reviewer-approved neighboring-zone work.
-4. Run the FastAPI backend before executing either path. The HTTP nodes use `host.docker.internal:8000`; Windows host access from Docker requires `-BindAddress 0.0.0.0` plus a Windows Firewall rule limited to the Docker network. This option previously worked in a live run, but verify it on the target host after changing the launcher default.
-5. Upload only synthetic or public clips for the demo. Open the local review page at `http://localhost:8000/` to inspect timestamps and candidates; approve a person candidate there before neighboring-zone work can be queued.
+   ```powershell
+   ./run_backend_video.ps1
+   ```
 
-## Search flow
+   The launcher binds to `127.0.0.1` by default. To force CPU inference, pass `-Device cpu`.
 
-1. Enter or dictate a clue, then review the transcribed words. Ollama extracts explicit target type, color, visible attribute notes, approximate time, and starting direction.
-2. The planner dispatches four directional workers. Each receives only clips registered for that direction. Missing clips stay waiting and never reach YOLO.
-3. Upload synthetic/public clips in the protected review page or through `POST /api/v1/videos`, supplying `case_id`, `jurisdiction`, `camera_id`, actual `recorded_at` with timezone, and the video file.
-4. FastAPI tracks person, bicycle, car, motorcycle, bus, and truck classes inside each clip. Per-clip track IDs do not identify the same person across cameras. The person color estimate uses the torso crop and avoids the head.
-5. Candidate sightings retain timestamps, offsets, camera, class, approximate color, confidence, and evidence hash. Appearance details such as scars, tattoos, clothing marks, and plate absence are not machine-verified.
-6. A human checks each clip. Only a reviewer-confirmed person candidate may start neighboring-zone searches. Vehicle/object follow-ups use configured type/color ranking. Follow-ups remain waiting until a matching local clip exists.
-7. Review labels are `confirmed_candidate`, `not_relevant`, or `needs_more_review`; they are not determinations of guilt or enforcement outcomes.
+4. Open `http://localhost:8000/health` and confirm the service and video-runtime status. Open `http://localhost:8000/` for the authenticated review interface.
 
-## API and tests
+5. For RTX 5050 CUDA inference, run `./setup_gpu.ps1` once, then start the GPU launcher:
 
-The n8n export calls `POST /api/v1/zones/analyze` for four-direction batches. Single-clip analysis remains available at `POST /api/v1/zone/analyze`. Evidence integrity can be checked with `GET /api/v1/integrity`.
+   ```powershell
+   ./setup_gpu.ps1
+   ./run_backend_gpu.ps1
+   ```
 
-Run the backend contract suite from this folder with the Python 3.14 runtime used for CUDA/audio testing:
+   Confirm that `/health` reports CUDA readiness. The GPU setup script expects Python 3.14 at `C:\Python314`.
+
+6. Voice transcription is optional. Run `./setup_audio.ps1` and then `./run_backend_gpu.ps1`. The first use downloads the selected Faster-Whisper model; later transcription runs locally. Configure `WHISPER_MODEL` and `WHISPER_DEVICE` in `.env` as needed.
+
+### Connecting Docker n8n to Windows
+
+The included workflow calls the host API at `host.docker.internal:8000`. Docker access requires a non-loopback listener; enable it explicitly:
 
 ```powershell
-$env:PYTHONHOME = "$env:LOCALAPPDATA\Programs\Python\Python314"
-$env:PYTHONPATH = "$env:USERPROFILE\Documents\Codex\cctv-audio-packages;$env:USERPROFILE\Documents\Codex\cctv-video-gpu-packages"
-& 'C:\Python314\python.exe' -m unittest discover -s tests -v
+./run_backend_gpu.ps1 -BindAddress 0.0.0.0
 ```
 
-The backend contract suite passed 31/31 on 2026-11-25. The live four-direction n8n → Ollama → FastAPI → RTX 5050 workflow ran successfully, stored eight actual person-class candidates (two per direction), and passed `/api/v1/integrity` (`valid`, audit chain valid, evidence files valid, sighting hashes valid). All eight need human review. The repeated synthetic frames do not validate realistic multi-camera matching. A separate manually triggered scheduled follow-up run analyzed two approved neighboring-zone jobs. The review page was visually checked earlier with synthetic candidates and completed East/West follow-ups. Today’s isolated H.264 test verified upload, byte-for-byte video delivery, 12-frame decoding, two CUDA detections, timestamped persistence, and integrity. Browser playback of that exact H.264 test remains unverified because the cloud in-app browser could not reach the host loopback address. The user-supplied MP4s need confirmed jurisdiction, camera ID, recording timestamp/timezone, and provenance before registration as case footage.
+This listens on all host interfaces. Before enabling it, configure Windows Firewall to allow port 8000 only from the Docker network and deny other networks. Do not expose the API to the public internet. Without this option, the backend remains loopback-only.
 
+## Importing the n8n workflow
+
+1. In n8n, import `n8n/CCTV-Investigation-Orchestrator-Import.json` as a new workflow. Keep existing workflows intact.
+2. Start the FastAPI backend and verify its health before running n8n.
+3. The manual trigger path runs the four-direction planner. Only clips registered for the case and direction are analyzed; missing clips remain in a waiting state.
+4. The form trigger provides a case-intake path. The scheduled trigger polls ready follow-up jobs and dispatches work for clips attached to reviewer-approved neighboring-zone searches.
+5. Upload synthetic or public clips through the review interface. Provide the case ID, jurisdiction, camera ID, and actual recording timestamp with timezone. A newly uploaded clip can make a waiting follow-up ready for analysis.
+6. Review candidates in the browser. A confirmed person candidate can queue a neighboring-zone search; the reviewer makes the final decision.
+
+The workflow JSON targets `host.docker.internal:8000`. Test this address from the Docker host after configuring the Windows listener and firewall.
+
+## Search and review behavior
+
+1. Enter or dictate a clue and review the parsed text and attributes.
+2. The planner assigns registered clips to the North, East, South, and West workers.
+3. YOLO detects supported object classes and tracks them within each clip. A track ID is local to that clip and is not a cross-camera identity.
+4. The API persists timestamped candidate records and associates each with its source clip and evidence hash.
+5. A reviewer inspects the video segment and records a review decision. Only a human-confirmed person candidate can start neighboring-zone work.
+
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/investigations/start` | Create or start a case and parse its clue with local Ollama |
+| `POST /api/v1/videos` | Register a local video with case, zone, camera, and recording-time metadata |
+| `POST /api/v1/zones/analyze` | Dispatch a batch of registered clips to directional workers |
+| `POST /api/v1/zone/analyze` | Analyze one registered clip |
+| `GET /api/v1/sightings` | List timestamped candidates for review |
+| `GET /api/v1/followups/ready` | List follow-up jobs with matching registered clips |
+| `POST /api/v1/followups/{id}/analyze` | Analyze a ready neighboring-zone clip |
+| `GET /api/v1/integrity` | Validate evidence hashes and the audit chain |
+
+Reviewer-facing routes use HTTP Basic authentication configured with `REVIEW_USERNAME` and `REVIEW_PASSWORD`. Keep the backend on a trusted local network.
+
+## Validation status
+
+- The backend contract suite contains 31 tests; it passed 31/31 on the local Python 3.14 runtime. Coverage includes zone validation, batch dispatch, reviewer gating, clue parsing behavior, persistence, integrity checks, upload/review routes, and launcher configuration. Audio transcription is mocked in the contract tests.
+- A live four-direction n8n run analyzed four synthetic clips on the RTX 5050 and persisted eight actual detector candidates. The integrity endpoint validated the audit chain, evidence files, and sighting hashes.
+- Local Ollama clue parsing, synthetic GPU follow-up analysis, and a scheduled n8n follow-up execution were exercised with synthetic data.
+- A synthetic H.264 clip passed API upload and file delivery, decoded as 12 frames at 640×360 and 5 fps, and produced two timestamped CUDA candidates. Browser playback of that exact clip was not verified in the cloud browser environment.
+
+## Limitations
+
+- No facial recognition, face matching, reference-photo identity matching, license-plate OCR, or identity claims.
+- Scars, tattoos, distinctive marks, bags, and similar free-text attributes are reviewer notes; they are not machine-verified. Person matching uses only broad visible class and color cues.
+- A vehicle or person track is not a confirmed sighting. Reviewers must inspect each candidate and its source footage.
+- Repeated synthetic frames validate routing and inference, not realistic multi-camera matching or field accuracy.
+- The review interface was visually checked with synthetic candidates. Exact H.264 browser playback and the current Windows Docker-to-host connection should be validated on the target workstation.
+- Configure real case camera locations, jurisdictions, recording timezones, retention, and footage provenance before using non-demo material.
+
+## Tests
+
+Create an isolated environment, install the backend and video requirements, then run the contract suite from the repository root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt -r requirements-video.txt
+python -m unittest discover -s tests -v
+```
+
+Evidence files and the SQLite database are stored locally under `data/` by default. These files are excluded from version control.
