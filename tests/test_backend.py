@@ -25,6 +25,19 @@ FOUR_ZONE_MAP = {
 
 
 class N8nWorkflowExportTests(unittest.TestCase):
+    def test_zone_batch_switch_routes_all_zone_items_to_backend_guard(self):
+        project_root = Path(__file__).resolve().parents[1]
+        for name in ("CCTV-Investigation-Orchestrator.json", "CCTV-Investigation-Orchestrator-Import.json"):
+            with self.subTest(workflow=name):
+                workflow = json.loads((project_root / "n8n" / name).read_text(encoding="utf-8-sig"))
+                nodes = {node["name"]: node for node in workflow["nodes"]}
+                self.assertEqual(
+                    workflow["connections"]["Aggregate Zone Work Items"]["main"][0]["node"], "Switch"
+                )
+                self.assertEqual(workflow["connections"]["Switch"]["main"][0][0]["node"], "Local Video API (backend required)")
+                condition = nodes["Switch"]["parameters"]["rules"]["values"][0]["conditions"]["conditions"][0]
+                self.assertEqual(condition["leftValue"], "={{ $json.items && $json.items.length > 0 }}")
+
     def test_scheduled_followup_nodes_are_connected_with_valid_dynamic_url_expression(self):
         project_root = Path(__file__).resolve().parents[1]
         for name in ("CCTV-Investigation-Orchestrator.json", "CCTV-Investigation-Orchestrator-Import.json"):
@@ -48,6 +61,17 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertIn("Copy-Item -LiteralPath '.env.example' -Destination '.env'", launcher)
         self.assertIn("--env-file .env", launcher)
         self.assertIn("$audioPackageTarget;$packageTarget;$projectRoot", launcher)
+        self.assertIn("[string]$BindAddress = '127.0.0.1'", launcher)
+        self.assertIn("--host $BindAddress", launcher)
+
+    def test_video_launchers_default_to_loopback_and_allow_explicit_docker_binding(self):
+        project_root = Path(__file__).resolve().parents[1]
+        for name in ("run_backend_gpu.ps1", "run_backend_video.ps1"):
+            with self.subTest(launcher=name):
+                launcher = (project_root / name).read_text(encoding="utf-8")
+                self.assertIn("[ValidateSet('127.0.0.1', '0.0.0.0')]", launcher)
+                self.assertIn("[string]$BindAddress = '127.0.0.1'", launcher)
+                self.assertIn("--host $BindAddress", launcher)
 
     def test_optional_audio_setup_uses_audio_requirements_and_pyav_compatibility_pin(self):
         project_root = Path(__file__).resolve().parents[1]
@@ -166,6 +190,8 @@ class BackendContractTests(unittest.TestCase):
         self.client.auth = None
         response = self.client.get("/api/v1/sightings")
         self.assertEqual(response.status_code, 401)
+        followups = self.client.get("/api/v1/followups")
+        self.assertEqual(followups.status_code, 401)
         self.client.auth = auth
 
     def test_review_page_serves_four_direction_upload_and_voice_controls(self):
@@ -181,6 +207,14 @@ class BackendContractTests(unittest.TestCase):
         self.assertIn('/api/v1/zones/analyze', response.text)
         self.assertIn("Transcribe locally", response.text)
         self.assertIn('id="progress-fill"', response.text)
+        self.assertIn('id="metric-candidates"', response.text)
+        self.assertIn("Case scope", response.text)
+        self.assertIn('id="metric-case" class="metric-value">All cases</strong>', response.text)
+        self.assertIn('getElementById("metric-case").textContent=caseId', response.text)
+        self.assertIn('class="clue-starters"', response.text)
+        self.assertIn('id="review-filter"', response.text)
+        self.assertIn('id="zone-filter"', response.text)
+        self.assertIn('/api/v1/followups', response.text)
         self.assertIn("function setStage(stage)", response.text)
         self.assertIn('.zone-card[data-zone="North"]', response.text)
         self.assertIn('row.dataset.state=result.status', response.text)

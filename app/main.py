@@ -723,7 +723,7 @@ def review_sighting(sighting_id: str, decision: ReviewDecision, _: str = Depends
 
 
 @app.get("/api/v1/followups")
-def list_followups(case_id: str | None = None, status: str | None = None):
+def list_followups(case_id: str | None = None, status: str | None = None, _: str = Depends(require_reviewer)):
     db.initialize()
     query = "SELECT * FROM followups WHERE 1=1"
     params: list[str] = []

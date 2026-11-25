@@ -1,4 +1,8 @@
-param([string]$Device = 'auto')
+param(
+    [string]$Device = 'auto',
+    [ValidateSet('127.0.0.1', '0.0.0.0')]
+    [string]$BindAddress = '127.0.0.1'
+)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -31,7 +35,7 @@ if (-not $env:HF_HOME) {
     $env:HF_HOME = Join-Path $projectRoot 'data\model-cache'
 }
 $env:YOLO_DEVICE = $Device
-& $pythonPath -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --env-file .env
+& $pythonPath -m uvicorn app.main:app --host $BindAddress --port 8000 --env-file .env
 if ($LASTEXITCODE -ne 0) {
     throw 'FastAPI exited with an error.'
 }

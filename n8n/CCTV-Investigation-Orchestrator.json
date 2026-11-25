@@ -105,7 +105,7 @@
     },
     {
       "parameters": {
-        "content": "## Four-direction workflow update — 2026-11-23\nFour zone workers: North, East, South, West. Each registered clip is assigned to its jurisdiction worker.\nPeople, bicycles, cars, motorcycles, buses, trucks; visible non-face clues only.\nPerson candidates require human confirmation before neighboring-zone follow-up.\nNo face recognition, identity matching, or plate OCR. No detections without registered clips.\nGPU inference and real four-feed test still require setup and clip metadata.",
+        "content": "## Four-direction workflow update — 2026-11-23\nFour zone workers: North, East, South, West. Each registered clip is assigned to its jurisdiction worker.\nSupported classes: people, bicycles, cars, motorcycles, buses, and trucks.\nPerson candidates require human confirmation before neighboring-zone follow-up.\nNo face recognition, identity matching, or plate OCR. No detections without registered clips.\nSynthetic four-feed RTX 5050 test passed. Real case footage needs verified camera, direction, recording time/timezone, and provenance.",
         "height": 336
       },
       "type": "n8n-nodes-base.stickyNote",
@@ -211,7 +211,7 @@
                 },
                 "conditions": [
                   {
-                    "leftValue": "={{ $json.items.some((item) => !!item.video_source_id) }}",
+                    "leftValue": "={{ $json.items && $json.items.length > 0 }}",
                     "rightValue": "",
                     "operator": {
                       "type": "boolean",
