@@ -14,7 +14,7 @@ export function Dashboard(){
   const jobs=progress.flatMap(q=>q.data?.jobs||[]);
   const evidence=progress.reduce((sum,q)=>sum+(q.data?.sighting_count||0),0);
   const jurisdictions=new Set((cases.data||[]).flatMap(c=>Object.keys(c.neighbors||{})));
-  const metric=(value:number)=>loading||failed?"—":String(value);
+  const metric=(value:number)=>cases.isLoading||cases.isError||loading||failed?"—":String(value);
   return <><h1>Investigation overview</h1><p className="muted">Live case, camera and processing information.</p>
     <div className="metrics">
       <article><span>Investigations</span><strong>{cases.data?.length??"—"}</strong></article>
