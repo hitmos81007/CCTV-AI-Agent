@@ -135,13 +135,26 @@ def _match_score(detection: dict[str, Any], clue: dict[str, Any] | None) -> floa
 
         def canonical_type(value: str) -> str:
             normalized = value.strip().lower()
+            if any(term in normalized for term in ("sedan", "coupe", "hatchback", "suv", "wagon", "van", "pickup", "automobile")):
+                return "car"
+            if any(term in normalized for term in ("motorcycle", "motorbike", "scooter", "moped")):
+                return "motorcycle"
+            if any(term in normalized for term in ("bicycle", "cycle")):
+                return "bicycle"
             aliases = {
                 "pedestrian": "person", "man": "person", "woman": "person", "cyclist": "person",
-                "sedan": "car", "suv": "car", "van": "car", "hatchback": "car", "automobile": "car",
-                "bike": "bicycle", "cycle": "bicycle", "motorbike": "motorcycle", "scooter": "motorcycle",
+                "bike": "bicycle",
                 "lorry": "truck",
             }
             return aliases.get(normalized, normalized)
+
+        def canonical_color(value: str) -> str:
+            normalized = value.strip().lower()
+            if any(word in normalized for word in ("navy", "sky", "light blue", "dark blue", "blue")):
+                return "blue"
+            if any(word in normalized for word in ("maroon", "burgundy", "crimson", "red")):
+                return "red"
+            return normalized
 
         scores: list[float] = []
         for target in targets:
@@ -149,9 +162,9 @@ def _match_score(detection: dict[str, Any], clue: dict[str, Any] | None) -> floa
             checks: list[float] = []
             if expected_type and expected_type != "other":
                 checks.append(1.0 if canonical_type(observed_type) == expected_type else 0.0)
-            expected_color = str(target.get("color") or "").strip().lower()
+            expected_color = canonical_color(str(target.get("color") or ""))
             if expected_color:
-                checks.append(1.0 if expected_color in observed_color else 0.0)
+                checks.append(1.0 if expected_color == canonical_color(observed_color) else 0.0)
             if checks:
                 score = sum(checks) / len(checks)
                 # A generic person-class hit is only a review candidate, not a match.
@@ -164,7 +177,18 @@ def _match_score(detection: dict[str, Any], clue: dict[str, Any] | None) -> floa
     checks: list[float] = []
     expected_color = (clue.get("vehicle_color") or "").strip().lower()
     if expected_color:
-        checks.append(1.0 if expected_color in (detection.get("vehicle_color") or "").lower() else 0.0)
+        observed_color = (detection.get("vehicle_color") or "").strip().lower()
+        blue_terms = ("navy", "sky", "light blue", "dark blue", "blue")
+        red_terms = ("maroon", "burgundy", "crimson", "red")
+        if any(term in expected_color for term in blue_terms):
+            expected_color = "blue"
+        elif any(term in expected_color for term in red_terms):
+            expected_color = "red"
+        if any(term in observed_color for term in blue_terms):
+            observed_color = "blue"
+        elif any(term in observed_color for term in red_terms):
+            observed_color = "red"
+        checks.append(1.0 if expected_color == observed_color else 0.0)
     expected_type = (clue.get("vehicle_type") or "").strip().lower()
     if expected_type:
         observed_type = (detection.get("vehicle_type") or "").lower()
@@ -181,6 +205,50 @@ def _match_score(detection: dict[str, Any], clue: dict[str, Any] | None) -> floa
             return normalized
         checks.append(1.0 if canonical_vehicle_type(expected_type) == canonical_vehicle_type(observed_type) else 0.0)
     return sum(checks) / len(checks) if checks else None
+
+
+def _matches_machine_clue(detection: dict[str, Any], clue: dict[str, Any] | None) -> bool:
+    """Keep only detections satisfying every structured type/color part of the clue."""
+    if not clue:
+        return False
+    targets = clue.get("visual_targets") or []
+    if not targets:
+        return _match_score(detection, clue) == 1.0
+
+    def kind(value: str) -> str:
+        text = value.strip().lower()
+        if text in {"man", "woman", "pedestrian", "cyclist"}:
+            return "person"
+        if any(word in text for word in ("car", "sedan", "suv", "hatchback", "coupe", "van", "pickup", "wagon")):
+            return "car"
+        if any(word in text for word in ("bicycle", "cycle", "bike")):
+            return "bicycle"
+        if any(word in text for word in ("motorcycle", "motorbike", "scooter", "moped")):
+            return "motorcycle"
+        return text
+
+    def color(value: str) -> str:
+        text = value.strip().lower()
+        if any(word in text for word in ("blue", "navy", "azure", "cyan")):
+            return "blue"
+        if any(word in text for word in ("red", "maroon", "burgundy", "crimson")):
+            return "red"
+        return text
+
+    observed_type = kind(str(detection.get("subject_type") or detection.get("vehicle_type") or ""))
+    observed_color = color(str(detection.get("vehicle_color") or ""))
+    for target in targets:
+        expected_type = str(target.get("target_type") or "").strip()
+        expected_color = str(target.get("color") or "").strip()
+        if not expected_type and not expected_color:
+            continue
+        if expected_type and kind(expected_type) != observed_type:
+            continue
+        if expected_color and color(expected_color) != observed_color:
+            continue
+        if expected_type or expected_color:
+            return True
+    return False
 
 
 def _case_or_404(db_conn, case_id: str):
@@ -545,6 +613,18 @@ def get_video_file(video_source_id: str, _: str = Depends(require_reviewer)):
     )
 
 
+@app.get("/api/v1/sightings/{sighting_id}/frame")
+def get_sighting_frame(sighting_id: str, _: str = Depends(require_reviewer)):
+    db.initialize()
+    with db.connection() as conn:
+        row = conn.execute("SELECT frame_path FROM sightings WHERE id=?", (sighting_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if not row["frame_path"] or not Path(row["frame_path"]).is_file():
+        raise HTTPException(status_code=404, detail="No still frame was captured for this stored candidate; rerun the clip search to create one")
+    return FileResponse(row["frame_path"], media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
 @app.post("/api/v1/zones/analyze")
 async def analyze_zones(request: AnalyzeZonesRequest, _: str = Depends(require_api_access)):
     """Dispatch the four directional work items together, with a local inference limit."""
@@ -623,33 +703,52 @@ def analyze_zone(request: AnalyzeZoneRequest, _: str = Depends(require_api_acces
     with db.connection() as conn:
         for detection in detections:
             score = _match_score(detection, clue)
+            # Keep only actual type/color matches. Free-text marks/accessories remain for
+            # human review and are never claimed as machine-confirmed attributes.
+            if not _matches_machine_clue(detection, clue):
+                continue
+            # Persist a normalized match indicator: every machine-readable type/color
+            # component passed. This is a clue filter, not a probability of identity.
+            score = 1.0
             sighting_id = str(uuid.uuid4())
-            occurred = detection["first_seen_at"]
-            if isinstance(occurred, datetime):
-                occurred = _iso(occurred)
             subject_type = detection.get("subject_type") or detection.get("vehicle_type") or "vehicle"
             visual_attributes = detection.get("visual_attributes") or []
+            frame_bytes = detection.get("frame_jpeg")
+            frame_offset = float(detection.get("frame_offset_seconds", detection["start_offset_seconds"]))
+            occurred = _iso(datetime.fromisoformat(video["recorded_at"]) + timedelta(seconds=frame_offset))
+            frame_path = None
+            frame_sha256 = None
+            if frame_bytes:
+                frame_dir = db.EVIDENCE_DIR / "frames"
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                frame_path = frame_dir / f"{sighting_id}.jpg"
+                frame_path.write_bytes(frame_bytes)
+                frame_sha256 = hashlib.sha256(frame_bytes).hexdigest()
             integrity_payload = {
                 "video_sha256": video["sha256"], "case_id": request.case_id, "worker_id": request.worker_id,
                 "jurisdiction": request.jurisdiction, "camera_id": video["camera_id"], "occurred_at": occurred,
-                "video_offset_seconds": detection["start_offset_seconds"], "vehicle_type": detection["vehicle_type"],
+                "video_offset_seconds": frame_offset, "vehicle_type": detection["vehicle_type"],
                 "vehicle_color": detection.get("vehicle_color"), "detector_confidence": detection["detector_confidence"],
                 "subject_type": subject_type, "visual_attributes": visual_attributes,
+                "frame_sha256": frame_sha256,
             }
             evidence_hash = hashlib.sha256((video["sha256"] + db.canonical_json(integrity_payload)).encode("utf-8")).hexdigest()
             conn.execute(
-                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,frame_path,frame_sha256,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sighting_id, request.case_id, request.worker_id, request.jurisdiction, video["camera_id"], request.video_source_id,
-                 occurred, detection["start_offset_seconds"], detection.get("track_id"), detection["vehicle_type"], detection.get("vehicle_color"),
-                 subject_type, db.canonical_json(visual_attributes), 2, detection["detector_confidence"], score, evidence_hash, "pending", db.utc_now()),
+                 occurred, frame_offset, detection.get("track_id"), detection["vehicle_type"], detection.get("vehicle_color"),
+                 subject_type, db.canonical_json(visual_attributes), 3, str(frame_path) if frame_path else None, frame_sha256,
+                 detection["detector_confidence"], score, evidence_hash, "pending", db.utc_now()),
             )
             sighting = {"id": sighting_id, "case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
                         "camera_id": video["camera_id"], "video_source_id": request.video_source_id, "occurred_at": occurred,
-                        "video_offset_seconds": detection["start_offset_seconds"], "track_id": detection.get("track_id"),
+                        "video_offset_seconds": frame_offset, "track_id": detection.get("track_id"),
                         "vehicle_type": detection["vehicle_type"], "vehicle_color": detection.get("vehicle_color"),
                         "subject_type": subject_type, "visual_attributes": visual_attributes,
                         "attributes_require_human_review": True,
                         "detector_confidence": detection["detector_confidence"], "clue_match_score": score,
+                        "frame_url": f"/api/v1/sightings/{sighting_id}/frame" if frame_path else None,
+                        "frame_sha256": frame_sha256,
                         "evidence_sha256": evidence_hash, "review_status": "pending"}
             sightings.append(sighting)
             # Do not link or propagate a person candidate across cameras/zones.
@@ -677,7 +776,8 @@ def analyze_zone(request: AnalyzeZoneRequest, _: str = Depends(require_api_acces
 
 
 @app.get("/api/v1/sightings")
-def list_sightings(case_id: str | None = None, review_status: str | None = None, _: str = Depends(require_reviewer)):
+def list_sightings(case_id: str | None = None, review_status: str | None = None,
+                   all_detections: bool = False, _: str = Depends(require_reviewer)):
     db.initialize()
     query = "SELECT s.*,c.clues_json AS case_clues_json FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE 1=1"
     params: list[str] = []
@@ -687,6 +787,8 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
     if review_status:
         query += " AND s.review_status=?"
         params.append(review_status)
+    if not all_detections:
+        query += " AND s.clue_match_score >= 0.99"
     query += " ORDER BY s.occurred_at DESC"
     with db.connection() as conn:
         rows = conn.execute(query, params).fetchall()
@@ -697,6 +799,7 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
         record["clue"] = json.loads(clue_text) if clue_text else None
         record["visual_attributes"] = json.loads(record["visual_attributes_json"] or "[]")
         record["subject_type"] = record["subject_type"] or record["vehicle_type"]
+        record["frame_url"] = f"/api/v1/sightings/{record['id']}/frame" if record.get("frame_path") else None
         records.append(record)
     return records
 
@@ -866,6 +969,14 @@ def integrity_status(_: str = Depends(require_api_access)):
             if int(sighting["integrity_version"] or 1) >= 2:
                 payload["subject_type"] = sighting["subject_type"]
                 payload["visual_attributes"] = json.loads(sighting["visual_attributes_json"])
+            if int(sighting["integrity_version"] or 1) >= 3:
+                frame_path = sighting["frame_path"]
+                frame_sha = None
+                if frame_path and Path(frame_path).is_file():
+                    frame_sha = hashlib.sha256(Path(frame_path).read_bytes()).hexdigest()
+                payload["frame_sha256"] = frame_sha
+                if frame_sha != sighting["frame_sha256"]:
+                    invalid_sightings.append(sighting["id"])
             expected = hashlib.sha256((sighting["video_sha256"] + db.canonical_json(payload)).encode("utf-8")).hexdigest()
             if expected != sighting["evidence_sha256"]:
                 invalid_sightings.append(sighting["id"])

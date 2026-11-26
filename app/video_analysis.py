@@ -126,5 +126,20 @@ def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0
                     current["subject_type"] = target_type
                     current["vehicle_type"] = target_type
                     current["visual_attributes"] = ([f"approximate torso color: {color}"] if target_type == "person" and color else [])
+            if confidence_value >= tracks[key]["detector_confidence"]:
+                x1, y1, x2, y2 = [int(value) for value in xyxys[index]]
+                evidence_frame = frame.copy()
+                cv2.rectangle(evidence_frame, (x1, y1), (x2, y2), (40, 220, 120), max(2, evidence_frame.shape[1] // 900))
+                label = f"{target_type} {confidence_value:.2f} | {frame_time.isoformat(timespec='seconds')}"
+                cv2.putText(evidence_frame, label, (max(8, x1), max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX,
+                            max(0.55, evidence_frame.shape[1] / 1800), (40, 220, 120), 2, cv2.LINE_AA)
+                # Preserve the source frame with a visible detector box, not a video seek link.
+                scale = min(1.0, 1280 / max(evidence_frame.shape[:2]))
+                if scale < 1.0:
+                    evidence_frame = cv2.resize(evidence_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                encoded, jpeg = cv2.imencode(".jpg", evidence_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+                if encoded:
+                    tracks[key]["frame_jpeg"] = jpeg.tobytes()
+                    tracks[key]["frame_offset_seconds"] = frame_index / fps
     return list(tracks.values())
 

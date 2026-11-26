@@ -112,7 +112,9 @@
     .record + .record { margin-top:14px; }
     .record-title { margin:0 0 12px; font-size:19px; }
     .record-grid { display:grid; grid-template-columns:minmax(280px,1fr) minmax(300px,1.1fr); gap:18px; align-items:start; }
-    video { width:100%; max-height:370px; border-radius:9px; background:#101820; }
+    .evidence-frame { display:block; width:100%; max-height:420px; object-fit:contain; border:1px solid var(--line); border-radius:10px; background:#101820; }
+    .frame-caption { margin:6px 0 0; color:var(--muted); font-size:12px; }
+    .frame-missing { display:grid; place-items:center; min-height:180px; padding:20px; border:1px dashed #bac5d5; border-radius:10px; background:#f5f7fb; color:var(--muted); text-align:center; }
     .record-meta { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 12px; margin:10px 0 14px; }
     .record-meta div { overflow-wrap:anywhere; color:var(--muted); font-size:13px; }
     .record-meta strong { color:var(--ink); }
@@ -217,7 +219,7 @@
 
   <section class="panel" aria-labelledby="review-title">
     <div class="panel-head"><div><h2 id="review-title">Review video candidates</h2><p class="sub">Check the clip and timestamp, then choose a review label. A person candidate can start neighboring-zone follow-up only after human confirmation.</p></div><span class="step-tag">Step 4</span></div>
-    <div class="toolbar"><label for="case-filter">Case filter</label><input id="case-filter" placeholder="All cases"><label for="review-filter">Review</label><select id="review-filter"><option value="">All statuses</option><option value="pending">To review</option><option value="confirmed_candidate">Confirmed</option><option value="not_relevant">Not relevant</option><option value="needs_more_review">More review</option></select><label for="zone-filter">Direction</label><select id="zone-filter"><option value="">All directions</option><option>North</option><option>West</option><option>South</option><option>East</option></select><button id="refresh" class="secondary">Refresh candidates</button><span id="count" class="record-count" aria-live="polite"></span></div>
+    <div class="toolbar"><label for="case-filter">Case filter</label><input id="case-filter" placeholder="All cases"><label for="review-filter">Review</label><select id="review-filter"><option value="">All statuses</option><option value="pending">To review</option><option value="confirmed_candidate">Confirmed</option><option value="not_relevant">Not relevant</option><option value="needs_more_review">More review</option></select><label for="zone-filter">Direction</label><select id="zone-filter"><option value="">All directions</option><option>North</option><option>West</option><option>South</option><option>East</option></select><label class="all-detections-toggle"><input id="all-detections" type="checkbox" style="width:auto;min-height:auto"> Include non-matching detections</label><button id="refresh" class="secondary">Refresh candidates</button><span id="count" class="record-count" aria-live="polite"></span></div>
     <section id="items" aria-live="polite" style="margin-top:14px"></section>
     <section aria-labelledby="followup-title" style="margin-top:22px"><div class="panel-head"><div><h3 id="followup-title">Neighboring direction follow-ups</h3><p class="sub">Follow-ups appear only after a human confirms a person candidate. A job waits until footage covers its time window.</p></div><span id="followup-count" class="step-tag">0 jobs</span></div><div id="followups" class="followup-list" aria-live="polite"></div></section>
   </section>
@@ -334,7 +336,7 @@ async function refresh(){
   items.replaceChildren(el("div","Loading review records…","empty"));
   const caseId=document.getElementById("case-filter").value.trim();
   document.getElementById("metric-case").textContent=caseId.length>12?caseId.slice(0,10)+"…":(caseId||"All cases");
-  const url=new URL("/api/v1/sightings",API_BASE_URL||location.origin);if(caseId)url.searchParams.set("case_id",caseId);const reviewStatus=document.getElementById("review-filter").value;if(reviewStatus)url.searchParams.set("review_status",reviewStatus);
+  const url=new URL("/api/v1/sightings",API_BASE_URL||location.origin);if(caseId)url.searchParams.set("case_id",caseId);const reviewStatus=document.getElementById("review-filter").value;if(reviewStatus)url.searchParams.set("review_status",reviewStatus);if(document.getElementById("all-detections").checked)url.searchParams.set("all_detections","true");
   try{
     const allRecords=await api(url.toString());const direction=document.getElementById("zone-filter").value;const records=direction?allRecords.filter(record=>record.jurisdiction===direction):allRecords;
     count.textContent=records.length+" candidate record"+(records.length===1?"":"s");
@@ -348,10 +350,12 @@ async function refresh(){
       const targetType=record.subject_type||record.vehicle_type;
       card.append(el("h3",(record.vehicle_color?record.vehicle_color+" ":"")+targetType+" · "+record.jurisdiction,"record-title"));
       const grid=el("div",undefined,"record-grid");
-      const video=document.createElement("video");video.controls=true;video.preload="metadata";video.crossOrigin="use-credentials";video.src=apiUrl("/api/v1/videos/"+encodeURIComponent(record.video_source_id)+"/file")+"#t="+(Number(record.video_offset_seconds)||0);
+      const evidence=document.createElement("div");
+      if(record.frame_url){const image=document.createElement("img");image.className="evidence-frame";image.alt="Source video still with the detected object outlined";image.crossOrigin="use-credentials";image.src=apiUrl(record.frame_url);image.addEventListener("error",()=>{image.replaceWith(el("div","Still frame is unavailable. Re-run analysis to capture fresh frame evidence.","frame-missing"));},{once:true});evidence.append(image,el("p","Source frame at "+Number(record.video_offset_seconds||0).toFixed(2)+" seconds · green box shows the detected object","frame-caption"));}
+      else evidence.append(el("div","This older candidate has no saved still frame. Re-run this clip to capture image evidence.","frame-missing"));
       const info=el("div");
       const meta=el("div",undefined,"record-meta");
-      for(const pair of [["Case",record.case_id],["Camera",record.camera_id],["Timestamp",record.occurred_at],["Confidence",Number(record.detector_confidence).toFixed(3)],["Clue comparison",record.clue_match_score==null?"not scored":Number(record.clue_match_score).toFixed(2)],["Review status",record.review_status]]){
+      for(const pair of [["Case",record.case_id],["Camera",record.camera_id],["Timestamp",record.occurred_at],["Detector confidence",Number(record.detector_confidence).toFixed(3)],["Structured clue match","type/color criteria passed"],["Review status",record.review_status]]){
         const row=el("div");row.append(el("strong",pair[0]+": "),document.createTextNode(String(pair[1]??"—")));meta.append(row);
       }
       info.append(meta);
@@ -374,7 +378,7 @@ async function refresh(){
         });
         actions.append(button);
       }
-      info.append(actions);grid.append(video,info);card.append(grid);items.append(card);
+      info.append(actions);grid.append(evidence,info);card.append(grid);items.append(card);
     }
   }catch(error){count.textContent="";items.replaceChildren(el("div","Could not load candidates: "+error.message,"empty"));}
 }
@@ -389,6 +393,7 @@ async function refreshFollowups(caseId,direction){
   }catch(error){document.getElementById("followup-count").textContent="Unavailable";panel.replaceChildren(el("div","Could not load follow-up searches: "+error.message,"empty"));}
 }
 document.getElementById("refresh").addEventListener("click",refresh);
+document.getElementById("all-detections").addEventListener("change",refresh);
 document.getElementById("review-filter").addEventListener("change",refresh);
 document.getElementById("zone-filter").addEventListener("change",refresh);
 document.getElementById("case-filter").addEventListener("keydown",event=>{if(event.key==="Enter")refresh();});

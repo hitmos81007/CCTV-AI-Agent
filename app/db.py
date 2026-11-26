@@ -78,6 +78,8 @@ def initialize() -> None:
                 subject_type TEXT NOT NULL DEFAULT 'vehicle',
                 visual_attributes_json TEXT NOT NULL DEFAULT '[]',
                 integrity_version INTEGER NOT NULL DEFAULT 1,
+                frame_path TEXT,
+                frame_sha256 TEXT,
                 detector_confidence REAL NOT NULL,
                 clue_match_score REAL,
                 evidence_sha256 TEXT NOT NULL,
@@ -119,6 +121,10 @@ def initialize() -> None:
             db.execute("ALTER TABLE sightings ADD COLUMN visual_attributes_json TEXT NOT NULL DEFAULT '[]'")
         if "integrity_version" not in sighting_columns:
             db.execute("ALTER TABLE sightings ADD COLUMN integrity_version INTEGER NOT NULL DEFAULT 1")
+        if "frame_path" not in sighting_columns:
+            db.execute("ALTER TABLE sightings ADD COLUMN frame_path TEXT")
+        if "frame_sha256" not in sighting_columns:
+            db.execute("ALTER TABLE sightings ADD COLUMN frame_sha256 TEXT")
 
 
 def audit(db: sqlite3.Connection, event_type: str, payload: Any) -> str:
