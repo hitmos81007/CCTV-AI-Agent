@@ -13,6 +13,30 @@ from typing import Any, Iterator
 DATA_DIR = Path(os.getenv("APP_DATA_DIR", "./data")).resolve()
 EVIDENCE_DIR = DATA_DIR / "evidence"
 DB_PATH = DATA_DIR / "investigation.sqlite3"
+VALID_ENVS = {"development", "test", "production"}
+
+
+def runtime_env() -> str:
+    env = os.getenv("CCTV_ENV", "development").strip().lower() or "development"
+    if env not in VALID_ENVS:
+        raise RuntimeError(f"Unsupported CCTV_ENV value: {env}")
+    return env
+
+
+def validate_runtime_config() -> dict[str, Any]:
+    env = runtime_env()
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if env == "production":
+        if not database_url:
+            raise RuntimeError("DATABASE_URL is mandatory when CCTV_ENV=production")
+        if not os.getenv("SUPABASE_URL", "").strip():
+            raise RuntimeError("SUPABASE_URL is mandatory when CCTV_ENV=production")
+        if not (
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+            or os.getenv("SUPABASE_SECRET_KEY", "").strip()
+        ):
+            raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY is mandatory when CCTV_ENV=production")
+    return {"env": env, "database_backend": "postgresql" if database_url else "sqlite"}
 
 class PostgresConnection:
     """Adapt the existing parameterized queries to psycopg."""
@@ -45,7 +69,12 @@ def canonical_json(value: Any) -> str:
 def connection() -> Iterator[sqlite3.Connection]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    env = runtime_env()
     database_url = os.getenv("DATABASE_URL", "").strip()
+    if env == "production" and not database_url:
+        raise RuntimeError("DATABASE_URL is required in production; SQLite fallback is disabled")
+    if env == "test" and database_url and os.getenv("CCTV_ALLOW_TEST_REMOTE_DB", "").strip() != "1":
+        raise RuntimeError("Refusing remote DATABASE_URL in test mode without CCTV_ALLOW_TEST_REMOTE_DB=1")
     if database_url:
         if not database_url.startswith(("postgresql://", "postgres://")):
             raise RuntimeError("DATABASE_URL must be a PostgreSQL connection URL")
@@ -143,35 +172,66 @@ def initialize() -> None:
             """
         )
         if isinstance(db, PostgresConnection):
-            migration_dir = Path(__file__).resolve().parent.parent / "migrations" / "postgresql"
-            exists = db.execute("SELECT to_regclass('schema_migrations') AS name").fetchone()["name"]
-            applied = {row["version"] for row in db.execute("SELECT version FROM schema_migrations").fetchall()} if exists else set()
-            if not {1, 2, 3}.issubset(applied):
-                db.execute("SELECT pg_advisory_xact_lock(71920101)")
-                exists = db.execute("SELECT to_regclass('schema_migrations') AS name").fetchone()["name"]
-                applied = {row["version"] for row in db.execute("SELECT version FROM schema_migrations").fetchall()} if exists else set()
-                for version, name in ((1, "001_initial.sql"), (2, "002_job_leases.sql"), (3, "003_orchestration_registry.sql")):
-                    if version not in applied:
-                        db.executescript((migration_dir / name).read_text(encoding="utf-8"))
+            from .migrations import apply_migrations, get_migration_status
+
+            database_url = os.getenv("DATABASE_URL", "").strip()
+            if runtime_env() == "production":
+                status = get_migration_status(database_url)
+                if status["pending"]:
+                    names = [item["name"] for item in status["pending"]]
+                    raise RuntimeError(f"Pending PostgreSQL migrations must be applied before startup: {names}")
+                return
+            apply_migrations(database_url)
             return
         db.executescript(schema)
+        case_columns = {row["name"] for row in db.execute("PRAGMA table_info(cases)").fetchall()}
+        for name, definition in (
+            ("owner_id", "TEXT"),
+            ("title", "TEXT"),
+            ("authorized_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ):
+            if name not in case_columns:
+                db.execute("ALTER TABLE cases ADD COLUMN " + name + " " + definition)
         columns = {row["name"] for row in db.execute("PRAGMA table_info(videos)").fetchall()}
-        if "duration_seconds" not in columns:
-            db.execute("ALTER TABLE videos ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 0")
+        for name, definition in (
+            ("duration_seconds", "REAL NOT NULL DEFAULT 0"),
+            ("upload_key", "TEXT"),
+            ("source_label", "TEXT"),
+            ("storage_kind", "TEXT"),
+            ("storage_key", "TEXT"),
+            ("media_status", "TEXT NOT NULL DEFAULT 'ready'"),
+        ):
+            if name not in columns:
+                db.execute("ALTER TABLE videos ADD COLUMN " + name + " " + definition)
         sighting_columns = {row["name"] for row in db.execute("PRAGMA table_info(sightings)").fetchall()}
-        if "subject_type" not in sighting_columns:
-            db.execute("ALTER TABLE sightings ADD COLUMN subject_type TEXT NOT NULL DEFAULT 'vehicle'")
-        if "visual_attributes_json" not in sighting_columns:
-            db.execute("ALTER TABLE sightings ADD COLUMN visual_attributes_json TEXT NOT NULL DEFAULT '[]'")
-        if "integrity_version" not in sighting_columns:
-            db.execute("ALTER TABLE sightings ADD COLUMN integrity_version INTEGER NOT NULL DEFAULT 1")
-        if "frame_path" not in sighting_columns:
-            db.execute("ALTER TABLE sightings ADD COLUMN frame_path TEXT")
-        if "frame_sha256" not in sighting_columns:
-            db.execute("ALTER TABLE sightings ADD COLUMN frame_sha256 TEXT")
-        if "clue_json" not in sighting_columns:
-            db.execute("ALTER TABLE sightings ADD COLUMN clue_json TEXT")
+        for name, definition in (
+            ("subject_type", "TEXT NOT NULL DEFAULT 'vehicle'"),
+            ("visual_attributes_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("integrity_version", "INTEGER NOT NULL DEFAULT 1"),
+            ("frame_path", "TEXT"),
+            ("frame_sha256", "TEXT"),
+            ("clue_json", "TEXT"),
+            ("job_id", "TEXT"),
+            ("candidate_key", "TEXT"),
+            ("frame_storage_key", "TEXT"),
+            ("reviewer_user_id", "TEXT"),
+            ("reviewed_at", "TEXT"),
+        ):
+            if name not in sighting_columns:
+                db.execute("ALTER TABLE sightings ADD COLUMN " + name + " " + definition)
         _migrate_registry(db)
+        run_columns = {row["name"] for row in db.execute("PRAGMA table_info(orchestration_runs)").fetchall()}
+        for name, definition in (
+            ("start_key", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'planning'"),
+            ("input_video_ids", "TEXT"),
+            ("error_code", "TEXT"),
+            ("started_at", "TEXT"),
+            ("finished_at", "TEXT"),
+        ):
+            if name not in run_columns:
+                db.execute("ALTER TABLE orchestration_runs ADD COLUMN " + name + " " + definition)
         job_columns = {row["name"] for row in db.execute("PRAGMA table_info(investigation_jobs)").fetchall()}
         for name, definition in (
             ("attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -179,9 +239,34 @@ def initialize() -> None:
             ("lease_expires_at", "TEXT"),
             ("next_run_at", "TEXT"),
             ("request_json", "TEXT"),
+            ("run_id", "TEXT"),
+            ("heartbeat_at", "TEXT"),
+            ("started_at", "TEXT"),
+            ("finished_at", "TEXT"),
         ):
             if name not in job_columns:
                 db.execute("ALTER TABLE investigation_jobs ADD COLUMN " + name + " " + definition)
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS finding_reviews (
+                id TEXT PRIMARY KEY,
+                sighting_id TEXT NOT NULL REFERENCES sightings(id),
+                case_id TEXT NOT NULL REFERENCES cases(case_id),
+                reviewer_user_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                note TEXT,
+                request_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(sighting_id, request_key)
+            );
+            CREATE TABLE IF NOT EXISTS case_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id TEXT NOT NULL REFERENCES cases(case_id),
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
 
 
 def _migrate_registry(conn):

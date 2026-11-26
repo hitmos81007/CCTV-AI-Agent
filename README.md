@@ -10,14 +10,13 @@ An autonomous multi-agent CCTV investigation prototype for uploading authorized 
 
 This repository is undergoing phased consolidation toward the target MVP defined in `docs/source-of-truth/06_Implementation_Plan.md`:
 
-- **Current Phase 1 Baseline (Verified Locally):**
+- **Current Phase 2 Baseline (Verified Locally & Against Supabase):**
   - Official frontend consolidated to **React 19 + TypeScript + Vite** (`frontend/react/`).
   - Isolated **Python 3.12** environment managed with `uv` (`requirements.txt`, `requirements-video.txt`).
-  - **FastAPI** backend (`app/main.py`) with local **SQLite** development database (`data/investigation.sqlite3` when `DATABASE_URL` is unset).
+  - **FastAPI** backend (`app/main.py`) with ordered **PostgreSQL** migrations (`app/migrations.py`, `migrations/postgresql/001`–`004`), owner-scoped RLS, `case_events` Realtime table, and private `cctv-evidence` Supabase Storage (`app/storage.py`), plus isolated local **SQLite** test/dev compatibility.
   - **Ollama** (`llama3.2:latest`) structured clue parsing (`app/ollama_client.py`).
   - **YOLO11n + ByteTrack** (`app/video_analysis.py`, `yolo11n.pt`) running in **CPU inference mode** (`torch` CPU wheel).
 - **Upcoming Phases (Not Yet Implemented):**
-  - **Phase 2:** Supabase PostgreSQL schema migrations (`004+`), owner-scoped RLS, `case_events`, and private Storage bucket.
   - **Phase 3:** Supabase Auth (JWT bearer verification replacing HTTP Basic Auth).
   - **Phase 4:** Simplified case creation and batch multi-video upload UI (requires `ffmpeg`/`ffprobe`).
   - **Phase 5:** Multi-worker concurrency (`FOR UPDATE SKIP LOCKED`) and RTX 5050 Blackwell (`sm_120`) CUDA acceleration.
@@ -55,6 +54,16 @@ Copy `.env.example` to `.env` for local development (never commit `.env` or secr
 
 ```powershell
 Copy-Item .env.example .env
+```
+
+### 1b. Database Migrations (Supabase PostgreSQL)
+
+When `DATABASE_URL` is configured in `.env`, inspect and apply ordered PostgreSQL migrations (`migrations/postgresql/001`–`004`) using:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.migrations --status
+.\.venv\Scripts\python.exe -m app.migrations --dry-run
+.\.venv\Scripts\python.exe -m app.migrations --apply
 ```
 
 ### 2. Frontend (React + Vite)
