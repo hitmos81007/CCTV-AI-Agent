@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -15,26 +16,49 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
 from .ollama_client import OLLAMA_BASE_URL, OLLAMA_MODEL, parse_vehicle_clues
-from .schemas import AnalyzeZoneRequest, AnalyzeZonesRequest, CaseCreate, ClueParseRequest, ResolveWorkItemsRequest, ReviewDecision
+from .schemas import AnalyzeZoneRequest, AnalyzeZonesRequest, CameraCreate, InvestigationStatusUpdate, NVRReplayCreate, RecordingCreate, CaseCreate, ClueParseRequest, ResolveWorkItemsRequest, ReviewDecision
 from .video_analysis import analyze_video
 
 
 app = FastAPI(title="CCTV Investigation Agent Local API", version="0.1.0")
+logger = logging.getLogger("cctv.api")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def structured_http_error(request: Request, exc: StarletteHTTPException):
+    error_id = str(uuid.uuid4())
+    logger.warning("request failed id=%s path=%s status=%s", error_id, request.url.path, exc.status_code)
+    return JSONResponse(status_code=exc.status_code, headers=exc.headers,
+                        content={"detail": exc.detail, "error": {"code": f"HTTP_{exc.status_code}", "id": error_id}})
+
+
+@app.exception_handler(RequestValidationError)
+async def structured_validation_error(request: Request, exc: RequestValidationError):
+    error_id = str(uuid.uuid4())
+    logger.warning("validation failed id=%s path=%s", error_id, request.url.path)
+    errors = [{k: v for k, v in error.items() if k not in ("input", "ctx", "url")} for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors),
+                        "error": {"code": "VALIDATION_ERROR", "id": error_id}})
 cors_origins = [origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 if cors_origins:
+    if "*" in cors_origins:
+        raise RuntimeError("CORS_ALLOWED_ORIGINS must list explicit frontend origins")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
     )
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "1024")) * 1024 * 1024
 FOLLOWUP_THRESHOLD = float(os.getenv("FOLLOWUP_MATCH_THRESHOLD", "0.70"))
@@ -395,6 +419,224 @@ def list_cases(_: str = Depends(require_api_access)):
     return [{**dict(row), "neighbors": json.loads(row["neighbors_json"]), "clues": json.loads(row["clues_json"]) if row["clues_json"] else None} for row in rows]
 
 
+@app.get("/api/v1/cases/{case_id}")
+def get_case(case_id: str, _: str = Depends(require_api_access)):
+    with db.connection() as conn:
+        row = dict(_case_or_404(conn, case_id))
+    row["neighbors"] = json.loads(row["neighbors_json"])
+    row["clues"] = json.loads(row["clues_json"]) if row["clues_json"] else None
+    return row
+
+
+@app.get("/api/v1/cases/{case_id}/jurisdictions")
+def get_jurisdictions(case_id: str, _: str = Depends(require_api_access)):
+    with db.connection() as conn:
+        row = _case_or_404(conn, case_id)
+        return {"case_id": case_id, "initial_zone": row["initial_zone"], "neighbors": json.loads(row["neighbors_json"])}
+
+
+@app.post("/api/v1/cameras", status_code=201)
+def register_camera(camera: CameraCreate, _: str = Depends(require_api_access)):
+    if camera.source_uri:
+        _validate_source_uri(camera.source_uri)
+    with db.connection() as conn:
+        if conn.execute("SELECT camera_id FROM cameras WHERE camera_id=?", (camera.camera_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="camera_id already exists")
+        conn.execute("INSERT INTO cameras(camera_id,jurisdiction,name,latitude,longitude,source_type,source_uri,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (camera.camera_id, camera.jurisdiction, camera.name, camera.latitude, camera.longitude,
+                      camera.source_type, camera.source_uri, db.utc_now()))
+        db.audit(conn, "camera_registered", camera.model_dump())
+    return camera.model_dump()
+
+
+def _validate_source_uri(uri: str) -> None:
+    from urllib.parse import parse_qsl, urlsplit
+    parsed = urlsplit(uri)
+    secret_keys = ("password", "passwd", "pwd", "secret", "token", "apikey", "api_key")
+    if parsed.username or parsed.password or any(key.lower() in secret_keys for key, _ in parse_qsl(parsed.query)):
+        raise HTTPException(status_code=422, detail="Store source credentials separately from the URI")
+
+
+@app.get("/api/v1/cameras")
+def list_cameras(_: str = Depends(require_api_access)):
+    with db.connection() as conn:
+        return [dict(row) for row in conn.execute("SELECT * FROM cameras ORDER BY camera_id").fetchall()]
+
+
+@app.get("/api/v1/cameras/{camera_id}/nvr-recordings")
+def discover_nvr_recordings(camera_id: str, _: str = Depends(require_reviewer)):
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM cameras WHERE camera_id=?", (camera_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    try:
+        from .onvif_nvr import OnvifNVR
+        return {"camera_id": camera_id, "recordings": jsonable_encoder(OnvifNVR(dict(row)).recordings())}
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="Install requirements-onvif.txt for NVR discovery") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("NVR discovery failed for camera %s: %s", camera_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="NVR discovery failed; check device compatibility and connectivity") from exc
+
+
+@app.post("/api/v1/cameras/{camera_id}/nvr-replay", status_code=201)
+def register_nvr_replay(camera_id: str, request: NVRReplayCreate, _: str = Depends(require_reviewer)):
+    with db.connection() as conn:
+        camera = conn.execute("SELECT * FROM cameras WHERE camera_id=?", (camera_id,)).fetchone()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    try:
+        from .onvif_nvr import OnvifNVR
+        uri = OnvifNVR(dict(camera)).replay_uri(request.recording_token)
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="Install requirements-onvif.txt for NVR replay") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("NVR replay request failed for camera %s: %s", camera_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="NVR replay request failed") from exc
+    result = register_recording(RecordingCreate(case_id=request.case_id, camera_id=camera_id,
+                                source_type="ip_camera", source_uri=uri, recorded_at=request.recorded_at), _)
+    return {**result, "source": "onvif_nvr_replay"}
+
+
+@app.post("/api/v1/recordings", status_code=201)
+def register_recording(recording: RecordingCreate, _: str = Depends(require_api_access)):
+    from urllib.parse import urlsplit
+    parsed = urlsplit(recording.source_uri)
+    _validate_source_uri(recording.source_uri)
+    if recording.source_type == "ip_camera" and parsed.scheme not in ("rtsp", "rtsps"):
+        raise HTTPException(status_code=422, detail="IP camera source must be an RTSP or RTSPS URI")
+    with db.connection() as conn:
+        case = _case_or_404(conn, recording.case_id)
+        camera = conn.execute("SELECT * FROM cameras WHERE camera_id=?", (recording.camera_id,)).fetchone()
+        if not camera:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        if camera["jurisdiction"] not in _case_zones(case):
+            raise HTTPException(status_code=422, detail="Camera jurisdiction is not part of this case")
+        rid = str(uuid.uuid4())
+        conn.execute("INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,source_uri,recorded_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (rid, recording.case_id, recording.camera_id, camera["jurisdiction"], recording.source_type,
+                      recording.source_uri, _iso(recording.recorded_at) if recording.recorded_at else None, "registered", db.utc_now()))
+        db.audit(conn, "recording_registered", {"id": rid, "case_id": recording.case_id, "source_type": recording.source_type})
+    return {"id": rid, "status": "registered", "ingestion_status": "not_ingested"}
+
+
+@app.get("/api/v1/recordings")
+def list_recordings(case_id: str, jurisdiction: str | None = None, camera_id: str | None = None,
+                    source_type: str | None = None, _: str = Depends(require_api_access)):
+    db.initialize()
+    with db.connection() as conn:
+        _case_or_404(conn, case_id)
+        items = [dict(row) for row in conn.execute("SELECT * FROM recordings WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()]
+        items = [row for row in items if (not jurisdiction or row["jurisdiction"] == jurisdiction)
+                 and (not camera_id or row["camera_id"] == camera_id)
+                 and (not source_type or row["source_type"] == source_type)]
+        external = [row for row in items if row["source_type"] != "upload"]
+        uploads = [dict(row) for row in conn.execute("SELECT video_source_id,case_id,camera_id,jurisdiction,recorded_at,sha256,byte_size,duration_seconds,created_at FROM videos WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()]
+    return {"items": items, "sources": external, "uploaded_videos": uploads}
+
+
+@app.get("/api/v1/recordings/{recording_id}")
+def get_recording(recording_id: str, _: str = Depends(require_api_access)):
+    db.initialize()
+    with db.connection() as conn:
+        record = conn.execute("SELECT * FROM recordings WHERE id=?", (recording_id,)).fetchone()
+        metadata = conn.execute("SELECT metadata_json FROM video_metadata WHERE video_source_id=?",
+                                (record["video_source_id"],)).fetchone() if record and record["video_source_id"] else None
+    if not record:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return {**dict(record), "metadata": json.loads(metadata["metadata_json"]) if metadata else None}
+
+
+@app.post("/api/v1/recordings/{recording_id}/analyze")
+def analyze_recording(recording_id: str, _: str = Depends(require_api_access)):
+    record = get_recording(recording_id, _)
+    if not record["video_source_id"] or record["status"] != "ready":
+        raise HTTPException(status_code=409, detail="Source must be ingested before analysis")
+    return analyze_zone(AnalyzeZoneRequest(
+        case_id=record["case_id"], jurisdiction=record["jurisdiction"],
+        worker_id="zone_worker_" + record["jurisdiction"].lower().replace(" ", "_"),
+        video_source_id=record["video_source_id"],
+    ), _)
+
+
+@app.post("/api/v1/recordings/{recording_id}/ingest")
+def ingest_recording(recording_id: str, seconds: int = 10, _: str = Depends(require_reviewer)):
+    if not 1 <= seconds <= 60:
+        raise HTTPException(status_code=422, detail="Capture duration must be between 1 and 60 seconds")
+    record = get_recording(recording_id, _)
+    try:
+        from .ingestion import ingest
+        video_id = ingest(record, seconds)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"recording_id": recording_id, "video_source_id": video_id, "status": "ready"}
+
+
+@app.get("/api/v1/agents")
+def list_agents(case_id: str, _: str = Depends(require_api_access)):
+    with db.connection() as conn:
+        case = _case_or_404(conn, case_id)
+        zones = json.loads(case["neighbors_json"])
+    return [{"worker_id": "zone_worker_" + zone.lower().replace(" ", "_"), "jurisdiction": zone,
+             "neighbors": neighbors} for zone, neighbors in zones.items()]
+
+
+@app.post("/api/v1/cases/{case_id}/plan")
+async def plan_case(case_id: str, idempotency_key: str | None = Header(default=None, max_length=128),
+                    _: str = Depends(require_api_access)):
+    try:
+        from .orchestration import plan_investigation
+        return await plan_investigation(case_id, idempotency_key)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="LangGraph is not installed") from exc
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        raise HTTPException(status_code=503, detail="Ollama is unavailable") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/cases/{case_id}/progress")
+def case_progress(case_id: str, _: str = Depends(require_api_access)):
+    with db.connection() as conn:
+        _case_or_404(conn, case_id)
+        jobs = [dict(row) for row in conn.execute("SELECT * FROM investigation_jobs WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()]
+        count = conn.execute("SELECT COUNT(*) AS total FROM sightings WHERE case_id=?", (case_id,)).fetchone()["total"]
+        state = conn.execute("SELECT status,updated_at FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+    return {"case_id": case_id, "status": state["status"] if state else "open",
+            "status_updated_at": state["updated_at"] if state else None, "jobs": jobs, "sighting_count": count}
+
+
+@app.put("/api/v1/cases/{case_id}/status")
+def update_case_status(case_id: str, request: InvestigationStatusUpdate, _: str = Depends(require_api_access)):
+    with db.connection() as conn:
+        _case_or_404(conn, case_id)
+        now = db.utc_now()
+        conn.execute("INSERT INTO investigation_states(case_id,status,updated_at) VALUES(?,?,?) ON CONFLICT(case_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at",
+                     (case_id, request.status, now))
+        db.audit(conn, "investigation_status_changed", {"case_id": case_id, "status": request.status})
+    return {"case_id": case_id, "status": request.status, "updated_at": now}
+
+
+@app.get("/api/v1/evidence")
+def list_evidence(case_id: str, _: str = Depends(require_reviewer)):
+    with db.connection() as conn:
+        _case_or_404(conn, case_id)
+        rows = conn.execute("SELECT id,video_source_id,occurred_at,video_offset_seconds,evidence_sha256,frame_sha256,review_status FROM sightings WHERE case_id=? ORDER BY occurred_at", (case_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
 @app.post("/api/v1/clues/parse")
 async def parse_clues(request: ClueParseRequest, _: str = Depends(require_api_access)):
     db.initialize()
@@ -518,6 +760,8 @@ async def upload_video(
             "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,recorded_at,sha256,byte_size,duration_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (video_id, case_id, jurisdiction, camera_id, Path(file.filename or "video").name, str(dest), _iso(recorded), sha, total, duration_seconds, db.utc_now()),
         )
+        conn.execute("INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,video_source_id,recorded_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (video_id, case_id, camera_id, jurisdiction, "upload", video_id, _iso(recorded), "ready", db.utc_now()))
         attached_followups = _attach_waiting_followups(conn, case_id, jurisdiction)
         db.audit(conn, "video_registered", {"video_source_id": video_id, "case_id": case_id, "jurisdiction": jurisdiction, "camera_id": camera_id, "sha256": sha, "byte_size": total, "duration_seconds": duration_seconds})
         if attached_followups:
@@ -689,6 +933,33 @@ def analyze_zone(request: AnalyzeZoneRequest, _: str = Depends(require_api_acces
     db.initialize()
     with db.connection() as conn:
         case = _case_or_404(conn, request.case_id)
+        video = conn.execute("SELECT case_id,jurisdiction FROM videos WHERE video_source_id=?", (request.video_source_id,)).fetchone()
+        if request.jurisdiction not in _case_zones(case):
+            raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
+        if video is None:
+            raise HTTPException(status_code=404, detail="video_source_id is not registered in the local evidence store")
+        if video["case_id"] != request.case_id or video["jurisdiction"] != request.jurisdiction:
+            raise HTTPException(status_code=409, detail="Video case or jurisdiction does not match this worker assignment")
+        job_id = str(uuid.uuid4())
+        now = db.utc_now()
+        conn.execute("INSERT INTO investigation_jobs(id,case_id,jurisdiction,video_source_id,worker_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (job_id, request.case_id, request.jurisdiction, request.video_source_id, request.worker_id, "processing", now, now))
+    try:
+        result = _analyze_zone(request)
+    except Exception as exc:
+        with db.connection() as conn:
+            conn.execute("UPDATE investigation_jobs SET status=?,error_detail=?,updated_at=? WHERE id=?",
+                         ("failed", str(getattr(exc, "detail", type(exc).__name__))[:1000], db.utc_now(), job_id))
+        raise
+    with db.connection() as conn:
+        conn.execute("UPDATE investigation_jobs SET status=?,updated_at=? WHERE id=?", ("completed", db.utc_now(), job_id))
+    return {**result, "job_id": job_id}
+
+
+def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_token: str | None = None):
+    db.initialize()
+    with db.connection() as conn:
+        case = _case_or_404(conn, request.case_id)
         if request.jurisdiction not in _case_zones(case):
             raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
         video = conn.execute("SELECT * FROM videos WHERE video_source_id=?", (request.video_source_id,)).fetchone()
@@ -779,6 +1050,11 @@ def analyze_zone(request: AnalyzeZoneRequest, _: str = Depends(require_api_acces
             followups.append(dict(row))
         db.audit(conn, "zone_analysis_completed", {"case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
                                                      "video_source_id": request.video_source_id, "sighting_count": len(sightings), "followup_count": len(followups)})
+        if job_id:
+            finished = conn.execute("UPDATE investigation_jobs SET status='completed',updated_at=?,lease_token=NULL,lease_expires_at=NULL WHERE id=? AND status='running' AND lease_token=?",
+                                    (db.utc_now(), job_id, lease_token))
+            if finished.rowcount != 1:
+                raise RuntimeError("Processing lease was lost before evidence commit")
     return {"case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
             "video_source_id": request.video_source_id, "video_sha256": video["sha256"], "analysis_engine": "ultralytics-yolo-visible-target-tracking",
             "target_scope": "people and common vehicles/objects; one-clip tracking only",
@@ -800,7 +1076,7 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
         query += " AND s.review_status=?"
         params.append(review_status)
     if not all_detections:
-        query += " AND s.clue_match_score >= 0.99"
+        query += " AND (s.clue_match_score >= 0.99 OR s.review_status='confirmed_candidate')"
     query += " ORDER BY s.occurred_at DESC"
     with db.connection() as conn:
         rows = conn.execute(query, params).fetchall()

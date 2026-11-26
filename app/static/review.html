@@ -184,9 +184,14 @@
     <div class="panel-head"><div><h2 id="case-title">Describe the case clue</h2><p class="sub">Use ordinary wording, including approximate time and place. Mention visible clothes, colors, carried items, vehicle type, or suspected marks for human review.</p></div><span class="step-tag">Step 1</span></div>
     <div class="form-grid">
       <label>Case ID<input id="case-id" maxlength="80" placeholder="e.g. DEMO-2026-01" autocomplete="off"><span class="field-note">Use your local case reference.</span></label>
-      <label>Starting direction<select id="initial-zone"><option>North</option><option>West</option><option>South</option><option>East</option></select><span class="field-note">The first area to prioritize.</span></label>
+      <label>Starting jurisdiction<select id="initial-zone"><option>North</option><option>West</option><option>South</option><option>East</option></select><span class="field-note">The first area to prioritize.</span></label>
       <label>What should the search look for?<textarea id="case-description" maxlength="4000" placeholder="Example: a person in a navy jacket carrying a red backpack near the north gate around 10:15."></textarea></label>
     </div>
+    <details><summary>Configure jurisdictions and neighbors</summary>
+      <label>Jurisdiction map as JSON<textarea id="jurisdiction-map" placeholder='{"Zone-1":["Zone-2"],"Zone-2":["Zone-1"]}'></textarea></label>
+      <button type="button" id="apply-jurisdictions" class="secondary">Apply jurisdiction map</button>
+      <span id="jurisdiction-status" class="status" role="status"></span>
+    </details>
     <div class="clue-starters" aria-label="Example clue starters"><span>Start with a clue:</span><button type="button" class="chip" data-clue="A person in a dark jacket carrying a bright backpack near the entrance.">🧥 Person + bag</button><button type="button" class="chip" data-clue="A light-colored car with no visible license plate, traveling east near the junction.">🚗 Car without plate</button><button type="button" class="chip" data-clue="A bicycle with a large basket and a blue frame near the market road.">🚲 Bicycle details</button></div>
     <div class="button-row"><button id="create-case" class="primary">Create case &amp; parse clue</button><span id="case-status" class="status" role="status" aria-live="polite"></span></div>
     <div id="case-summary" class="case-summary" aria-live="polite"></div>
@@ -212,7 +217,7 @@
   </section>
 
   <section class="panel" aria-labelledby="search-title">
-    <div class="panel-head"><div><h2 id="search-title">Search the four directions</h2><p class="sub">Each direction receives its registered clip. Directions without footage remain marked as waiting; they will not create detections.</p></div><span class="step-tag">Step 3</span></div>
+    <div class="panel-head"><div><h2 id="search-title">Search jurisdictions</h2><p class="sub">Each jurisdiction receives its registered clips. Areas without footage remain marked as waiting.</p></div><span class="step-tag">Step 3</span></div>
     <div class="button-row"><button id="run-search" class="primary" disabled>Search registered clips</button><span id="search-summary" class="status" role="status" aria-live="polite"></span></div>
     <div id="search-results" class="search-result-list" aria-live="polite"></div>
   </section>
@@ -225,22 +230,51 @@
   </section>
 </main>
 <script>
-const zones = ["North","West","South","East"];
-const neighbors = {North:["East","West"],West:["North","South"],South:["East","West"],East:["North","South"]};
+let zones = ["North","West","South","East"];
+let neighbors = {North:["East","West"],West:["North","South"],South:["East","West"],East:["North","South"]};
 const items = document.getElementById("items");
 const count = document.getElementById("count");
 let currentCaseId = "";
 function el(tag,text,className){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;}
 const API_BASE_URL=(window.CCTV_API_BASE_URL||"").replace(/\/+$/,"");
 function apiUrl(path){return new URL(path,API_BASE_URL||location.origin).toString();}
-async function api(url,options){const requestUrl=apiUrl(url);let response;try{response=await fetch(requestUrl,{credentials:"include",...options});}catch(error){const apiOrigin=new URL(requestUrl).origin;throw new Error("Could not reach the processing backend at "+apiOrigin+". Check that FastAPI is running, the address uses a browser-reachable connection, and CORS_ALLOWED_ORIGINS includes this site. This is a connection/CORS issue, not a database error.");}let body={};try{body=await response.json();}catch{}if(!response.ok)throw new Error(body.detail||("Request failed ("+response.status+")"));return body;}
+async function api(url,options){const requestUrl=apiUrl(url);let response;try{response=await fetch(requestUrl,{credentials:"include",...options});}catch(error){const apiOrigin=new URL(requestUrl).origin;throw new Error("Could not reach the processing backend at "+apiOrigin+". Check that FastAPI is running, the address uses a browser-reachable connection, and CORS_ALLOWED_ORIGINS includes this site.");}let body={};try{body=await response.json();}catch{}if(!response.ok){const detail=Array.isArray(body.detail)?body.detail.map(item=>item.msg||"Invalid value").join("; "):body.detail;throw new Error(detail||("Request failed ("+response.status+")"));}return body;}
 function setWorkflowStatus(text){document.getElementById("workflow-status").textContent=text;}
 function setStage(stage){document.querySelectorAll(".steps .step").forEach((step,index)=>{step.classList.toggle("active",index+1===stage);step.classList.toggle("done",index+1<stage);});document.getElementById("progress-fill").style.width=(stage*25)+"%";}
 function setCaseEnabled(enabled){document.getElementById("upload-clips").disabled=!enabled;document.getElementById("run-search").disabled=!enabled;document.getElementById("active-case-label").textContent=enabled?"Active case: "+currentCaseId:"Create a case to enable feed upload.";}
-function updateFeedMetric(){const selected=[...document.querySelectorAll(".zone-card .clip-file")].filter(input=>input.files[0]).length;document.getElementById("metric-feeds").textContent=selected+" / 4";}
+function updateFeedMetric(){const selected=[...document.querySelectorAll(".zone-card .clip-file")].filter(input=>input.files[0]).length;document.getElementById("metric-feeds").textContent=selected+" / "+zones.length;}
 document.querySelectorAll(".clue-starters .chip").forEach(button=>button.addEventListener("click",()=>{const box=document.getElementById("case-description");const sample=button.dataset.clue;box.value=box.value.trim()?box.value.trim()+" "+sample:sample;box.focus();}));
 document.querySelectorAll(".zone-card").forEach(card=>card.addEventListener("focusin",()=>card.classList.add("selected")));
 document.querySelectorAll(".zone-card .clip-file").forEach(input=>input.addEventListener("change",()=>{const card=input.closest(".zone-card");const file=input.files[0];card.classList.toggle("has-file",!!file);card.querySelector(".zone-state").textContent=file?"Ready to upload · "+file.name:"";updateFeedMetric();}));
+function setJurisdictions(map){
+  if(!map||typeof map!=="object"||Array.isArray(map))throw new Error("The jurisdiction map must be a JSON object.");
+  const names=Object.keys(map);
+  if(!names.length||names.length>6||!names.every(name=>name.trim()&&Array.isArray(map[name])&&map[name].every(n=>names.includes(n)&&n!==name)))throw new Error("Provide one to six named jurisdictions with valid neighboring jurisdictions.");
+  zones=names;neighbors=map;
+  const initial=document.getElementById("initial-zone"),filter=document.getElementById("zone-filter"),grid=document.querySelector(".zone-grid");
+  initial.replaceChildren(...names.map(name=>new Option(name,name)));
+  filter.replaceChildren(new Option("All jurisdictions",""),...names.map(name=>new Option(name,name)));
+  grid.replaceChildren();
+  for(const name of names){
+    const card=el("div",undefined,"zone-card");card.dataset.zone=name;
+    const title=el("div",undefined,"zone-title");title.append(el("h3",name),el("span","Jurisdiction","zone-direction"));card.append(title);
+    for(const [labelText,cls,type] of [["Camera ID","camera-id","text"],["Recording date and time","recorded-at","datetime-local"],["Video clip","clip-file","file"]]){
+      const label=el("label",labelText),input=document.createElement("input");input.className=cls;input.type=type;
+      if(type==="file")input.accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,.m4v";
+      label.append(input);card.append(label);
+    }
+    card.append(el("p","","zone-state"));
+    card.addEventListener("focusin",()=>card.classList.add("selected"));
+    card.querySelector(".clip-file").addEventListener("change",event=>{const file=event.target.files[0];card.classList.toggle("has-file",!!file);card.querySelector(".zone-state").textContent=file?"Ready to upload · "+file.name:"";updateFeedMetric();});
+    grid.append(card);
+  }
+  updateFeedMetric();
+}
+document.getElementById("apply-jurisdictions").addEventListener("click",()=>{
+  const status=document.getElementById("jurisdiction-status");
+  try{setJurisdictions(JSON.parse(document.getElementById("jurisdiction-map").value));status.textContent=zones.length+" jurisdictions configured.";}
+  catch(error){status.textContent="Could not apply map: "+error.message;}
+});
 document.getElementById("create-case").addEventListener("click",async()=>{
   const caseId=document.getElementById("case-id").value.trim();
   const description=document.getElementById("case-description").value.trim();
@@ -263,6 +297,7 @@ document.getElementById("create-case").addEventListener("click",async()=>{
       reusedExisting=true;
     }
     currentCaseId=result.case_id;
+    if(JSON.stringify(result.neighbors)!==JSON.stringify(neighbors))setJurisdictions(result.neighbors);
     document.getElementById("metric-case").textContent=currentCaseId.length>12?currentCaseId.slice(0,10)+"…":currentCaseId;
     const parsed=result.clue;
     const targets=(parsed.visual_targets||[]).map(x=>(x.color?x.color+" ":"")+x.target_type+((x.attributes||[]).length?" — "+x.attributes.join(", "):"")).join("; ");
@@ -270,7 +305,7 @@ document.getElementById("create-case").addEventListener("click",async()=>{
     summary.replaceChildren(el("strong","Case "+currentCaseId+" is ready"));
     summary.append(el("div",targets?"Parsed clue: "+targets:"Parsed clue: no visual target was extracted; review the description."));
     if(parsed.event_time_text)summary.append(el("div","Approximate time from clue: "+parsed.event_time_text));
-    summary.append(el("div","Starting direction: "+result.initial_zone+" · Four direction workers ready"));
+    summary.append(el("div","Starting jurisdiction: "+result.initial_zone+" · "+zones.length+" jurisdiction workers ready"));
     summary.classList.add("visible");
     setCaseEnabled(true);setStage(2);status.textContent=reusedExisting?"Existing case reused. The new clue is saved; its registered camera clips and prior review decisions are retained.":"Case saved on the backend. Check the parsed clue above, then add camera feeds.";
     setWorkflowStatus(reusedExisting?"Updated clue ready. Existing camera clips are available for another search.":"Case ready. Add synthetic or public footage to the directions you want to search.");
@@ -316,11 +351,11 @@ document.getElementById("upload-clips").addEventListener("click",async()=>{
 document.getElementById("run-search").addEventListener("click",async()=>{
   if(!currentCaseId){document.getElementById("search-summary").textContent="Create a case first.";return;}
   const button=document.getElementById("run-search");const summary=document.getElementById("search-summary");const output=document.getElementById("search-results");
-  button.disabled=true;summary.textContent="Preparing four direction workers…";output.replaceChildren();
+  button.disabled=true;summary.textContent="Preparing jurisdiction workers…";output.replaceChildren();
   try{
     const workItems=zones.map(zone=>({case_id:currentCaseId,worker_id:"zone_worker_"+zone.toLowerCase(),jurisdiction:zone,neighbors:neighbors[zone],description:document.getElementById("case-description").value.trim()}));
     const resolved=await api("/api/v1/work-items/resolve",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:currentCaseId,items:workItems})});
-    summary.textContent=resolved.ready_count+" clip(s) ready across four directions. Analysis is running locally…";
+    summary.textContent=resolved.ready_count+" clip(s) ready across "+zones.length+" jurisdictions. Analysis is running locally…";
     const analysis=await api("/api/v1/zones/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:currentCaseId,items:resolved.items})});
     let candidates=0;let awaiting=0;
     for(const result of analysis.results||[]){

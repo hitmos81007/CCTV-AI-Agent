@@ -15,11 +15,55 @@ class CaseCreate(BaseModel):
     neighbors: dict[str, list[str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def require_four_direction_map(self):
-        directions = {"North", "West", "South", "East"}
-        if self.initial_zone not in directions or not directions.issubset(self.neighbors):
-            raise ValueError("The case must define North, West, South, and East jurisdictions.")
+    def validate_jurisdictions(self):
+        if not 1 <= len(self.neighbors) <= 6:
+            raise ValueError("Define between one and six jurisdictions.")
+        if self.initial_zone not in self.neighbors:
+            raise ValueError("Initial jurisdiction must appear in the jurisdiction map.")
+        for zone, adjacent in self.neighbors.items():
+            if not zone.strip() or len(zone) > 80:
+                raise ValueError("Jurisdiction names must contain 1 to 80 characters.")
+            if len(adjacent) != len(set(adjacent)) or any(x not in self.neighbors or x == zone for x in adjacent):
+                raise ValueError("Neighbors must be distinct, defined jurisdictions other than the jurisdiction itself.")
         return self
+
+
+class CameraCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    camera_id: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+    jurisdiction: str = Field(min_length=1, max_length=80)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    source_type: str = Field(pattern="^(ip_camera|police_archive|dvr|upload)$")
+    source_uri: str | None = Field(default=None, max_length=2048)
+
+    @model_validator(mode="after")
+    def validate_coordinates(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("Provide both latitude and longitude.")
+        return self
+
+
+class RecordingCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    case_id: str = Field(min_length=1, max_length=80)
+    camera_id: str = Field(min_length=1, max_length=80)
+    source_type: str = Field(pattern="^(ip_camera|police_archive|dvr)$")
+    source_uri: str = Field(min_length=1, max_length=2048)
+    recorded_at: datetime | None = None
+
+
+class InvestigationStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: str = Field(pattern="^(open|searching|review|closed)$")
+
+
+class NVRReplayCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    case_id: str = Field(min_length=1, max_length=80)
+    recording_token: str = Field(min_length=1, max_length=256)
+    recorded_at: datetime
 
 
 class VisualTargetClue(BaseModel):
