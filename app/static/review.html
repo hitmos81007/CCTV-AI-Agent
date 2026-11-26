@@ -251,7 +251,17 @@ document.getElementById("create-case").addEventListener("click",async()=>{
   if(description.length<3){status.textContent="Add a short description of the visual clue.";return;}
   button.disabled=true;status.dataset.state="";status.textContent="Creating the case and parsing the clue on the connected backend…";
   try{
-    const result=await api("/api/v1/investigations/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:caseId,description,initial_zone:initialZone,neighbors})});
+    let result,reusedExisting=false;
+    try{result=await api("/api/v1/investigations/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:caseId,description,initial_zone:initialZone,neighbors})});}
+    catch(error){
+      if(!error.message.includes("case_id exists with different case data"))throw error;
+      const savedCases=await api("/api/v1/cases");
+      const savedCase=savedCases.find(item=>item.case_id===caseId);
+      if(!savedCase)throw error;
+      const parsed=await api("/api/v1/clues/parse",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({case_id:caseId,description,initial_zone:savedCase.initial_zone})});
+      result={case_id:savedCase.case_id,description,initial_zone:savedCase.initial_zone,neighbors:savedCase.neighbors,clue:parsed};
+      reusedExisting=true;
+    }
     currentCaseId=result.case_id;
     document.getElementById("metric-case").textContent=currentCaseId.length>12?currentCaseId.slice(0,10)+"…":currentCaseId;
     const parsed=result.clue;
@@ -262,8 +272,8 @@ document.getElementById("create-case").addEventListener("click",async()=>{
     if(parsed.event_time_text)summary.append(el("div","Approximate time from clue: "+parsed.event_time_text));
     summary.append(el("div","Starting direction: "+result.initial_zone+" · Four direction workers ready"));
     summary.classList.add("visible");
-    setCaseEnabled(true);setStage(2);status.textContent="Case saved on the backend. Check the parsed clue above, then add camera feeds.";
-    setWorkflowStatus("Case ready. Add synthetic or public footage to the directions you want to search.");
+    setCaseEnabled(true);setStage(2);status.textContent=reusedExisting?"Existing case reused. The new clue is saved; its registered camera clips and prior review decisions are retained.":"Case saved on the backend. Check the parsed clue above, then add camera feeds.";
+    setWorkflowStatus(reusedExisting?"Updated clue ready. Existing camera clips are available for another search.":"Case ready. Add synthetic or public footage to the directions you want to search.");
   }catch(error){status.dataset.state="error";status.textContent="Could not create the case. "+error.message;}
   finally{button.disabled=false;}
 });

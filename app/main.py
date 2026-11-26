@@ -400,8 +400,11 @@ async def parse_clues(request: ClueParseRequest, _: str = Depends(require_api_ac
     db.initialize()
     with db.connection() as conn:
         case = _case_or_404(conn, request.case_id)
+        saved_initial_zone = case["initial_zone"]
+        previous_clue_json = case["clues_json"]
     try:
-        clue = await parse_vehicle_clues(request.case_id, request.description, request.initial_zone)
+        # A case keeps its saved direction map; clue updates can reuse its footage.
+        clue = await parse_vehicle_clues(request.case_id, request.description, saved_initial_zone)
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise HTTPException(status_code=503, detail=f"Local Ollama is not available at {OLLAMA_BASE_URL}") from exc
     except httpx.HTTPStatusError as exc:
@@ -409,8 +412,15 @@ async def parse_clues(request: ClueParseRequest, _: str = Depends(require_api_ac
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail="Ollama response did not match the clue schema") from exc
     with db.connection() as conn:
-        conn.execute("UPDATE cases SET clues_json=? WHERE case_id=?", (clue.model_dump_json(), request.case_id))
-        db.audit(conn, "vehicle_clues_parsed", {"case_id": request.case_id, "parser": clue.parser, "clue": clue.model_dump()})
+        if previous_clue_json:
+            # Freeze the old query context onto legacy sightings before replacing the
+            # case's active clue; preserve their video and review decisions unchanged.
+            conn.execute("UPDATE sightings SET clue_json=? WHERE case_id=? AND clue_json IS NULL",
+                         (previous_clue_json, request.case_id))
+        conn.execute("UPDATE cases SET description=?,clues_json=? WHERE case_id=?",
+                     (request.description, clue.model_dump_json(), request.case_id))
+        db.audit(conn, "case_clue_updated", {"case_id": request.case_id, "description": request.description,
+                                               "parser": clue.parser, "clue": clue.model_dump()})
     return clue.model_dump()
 
 
@@ -731,13 +741,15 @@ def analyze_zone(request: AnalyzeZoneRequest, _: str = Depends(require_api_acces
                 "vehicle_color": detection.get("vehicle_color"), "detector_confidence": detection["detector_confidence"],
                 "subject_type": subject_type, "visual_attributes": visual_attributes,
                 "frame_sha256": frame_sha256,
+                "clue": clue,
             }
             evidence_hash = hashlib.sha256((video["sha256"] + db.canonical_json(integrity_payload)).encode("utf-8")).hexdigest()
             conn.execute(
-                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,frame_path,frame_sha256,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,clue_json,frame_path,frame_sha256,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sighting_id, request.case_id, request.worker_id, request.jurisdiction, video["camera_id"], request.video_source_id,
                  occurred, frame_offset, detection.get("track_id"), detection["vehicle_type"], detection.get("vehicle_color"),
-                 subject_type, db.canonical_json(visual_attributes), 3, str(frame_path) if frame_path else None, frame_sha256,
+                 subject_type, db.canonical_json(visual_attributes), 4, db.canonical_json(clue) if clue else None,
+                 str(frame_path) if frame_path else None, frame_sha256,
                  detection["detector_confidence"], score, evidence_hash, "pending", db.utc_now()),
             )
             sighting = {"id": sighting_id, "case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
@@ -796,7 +808,8 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
     for row in rows:
         record = dict(row)
         clue_text = record.pop("case_clues_json")
-        record["clue"] = json.loads(clue_text) if clue_text else None
+        sighting_clue = record.get("clue_json")
+        record["clue"] = json.loads(sighting_clue) if sighting_clue else (json.loads(clue_text) if clue_text else None)
         record["visual_attributes"] = json.loads(record["visual_attributes_json"] or "[]")
         record["subject_type"] = record["subject_type"] or record["vehicle_type"]
         record["frame_url"] = f"/api/v1/sightings/{record['id']}/frame" if record.get("frame_path") else None
@@ -977,6 +990,8 @@ def integrity_status(_: str = Depends(require_api_access)):
                 payload["frame_sha256"] = frame_sha
                 if frame_sha != sighting["frame_sha256"]:
                     invalid_sightings.append(sighting["id"])
+            if int(sighting["integrity_version"] or 1) >= 4:
+                payload["clue"] = json.loads(sighting["clue_json"]) if sighting["clue_json"] else None
             expected = hashlib.sha256((sighting["video_sha256"] + db.canonical_json(payload)).encode("utf-8")).hexdigest()
             if expected != sighting["evidence_sha256"]:
                 invalid_sightings.append(sighting["id"])
