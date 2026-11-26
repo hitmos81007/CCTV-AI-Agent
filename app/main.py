@@ -1136,6 +1136,28 @@ def review_sighting(sighting_id: str, decision: ReviewDecision, _: str = Depends
             "follow_up_zones_queued": dispatched_followups}
 
 
+@app.get("/api/v1/sightings/{sighting_id}/reviews")
+def review_history(sighting_id: str, _: str = Depends(require_reviewer)):
+    with db.connection() as conn:
+        if not conn.execute("SELECT id FROM sightings WHERE id=?", (sighting_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Sighting not found")
+        events = conn.execute("SELECT payload_json,created_at FROM audit_log WHERE event_type=? ORDER BY id DESC",
+                              ("human_review_recorded",)).fetchall()
+        imported = []
+        if isinstance(conn, db.PostgresConnection):
+            table = conn.execute("SELECT to_regclass('imported_sqlite_audit') AS name").fetchone()
+            if table["name"]:
+                imported = conn.execute("SELECT payload_json,created_at FROM imported_sqlite_audit WHERE event_type=? ORDER BY original_id DESC",
+                                        ("human_review_recorded",)).fetchall()
+    history = []
+    for event in [*events, *imported]:
+        payload = json.loads(event["payload_json"])
+        if payload.get("sighting_id") == sighting_id:
+            history.append({"reviewer": payload.get("reviewer"), "decision": payload.get("decision"),
+                            "note": payload.get("note"), "created_at": event["created_at"]})
+    return sorted(history, key=lambda item: item["created_at"], reverse=True)
+
+
 @app.get("/api/v1/followups")
 def list_followups(case_id: str | None = None, status: str | None = None, _: str = Depends(require_reviewer)):
     db.initialize()
