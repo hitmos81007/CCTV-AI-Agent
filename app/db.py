@@ -172,16 +172,16 @@ def initialize() -> None:
             """
         )
         if isinstance(db, PostgresConnection):
-            from .migrations import apply_migrations, get_migration_status
+            from .migrations import get_migration_status
 
             database_url = os.getenv("DATABASE_URL", "").strip()
-            if runtime_env() == "production":
-                status = get_migration_status(database_url)
-                if status["pending"]:
-                    names = [item["name"] for item in status["pending"]]
-                    raise RuntimeError(f"Pending PostgreSQL migrations must be applied before startup: {names}")
-                return
-            apply_migrations(database_url)
+            status = get_migration_status(database_url)
+            if status["pending"]:
+                names = [item["name"] for item in status["pending"]]
+                raise RuntimeError(
+                    "Pending PostgreSQL migrations must be applied explicitly via "
+                    f"`python -m app.migrations --apply` before startup: {names}"
+                )
             return
         db.executescript(schema)
         case_columns = {row["name"] for row in db.execute("PRAGMA table_info(cases)").fetchall()}
