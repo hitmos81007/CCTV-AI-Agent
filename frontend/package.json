@@ -6,7 +6,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "npm --prefix react run build",
+    "dev": "npm --prefix react run dev",
+    "install:react": "npm --prefix react ci",
+    "build": "npm --prefix react ci && npm --prefix react run build",
+    "build:only": "npm --prefix react run build",
     "build:legacy": "node build-legacy.mjs"
   }
 }
