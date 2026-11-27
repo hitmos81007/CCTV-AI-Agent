@@ -12,6 +12,13 @@ import httpx
 
 SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 DEFAULT_EVIDENCE_BUCKET = "cctv-evidence"
+DEFAULT_VERIFICATION_BUCKET = "officer-verification"
+DEFAULT_VERIFICATION_MAX_BYTES = 5 * 1024 * 1024
+ALLOWED_VERIFICATION_MIME_TYPES = {
+    "application/pdf": ".pdf",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+}
 
 
 class StorageConfigError(RuntimeError):
@@ -170,3 +177,94 @@ class SupabaseEvidenceStorage:
             resp = client.delete(url, headers=self._headers())
         if resp.status_code not in (200, 204, 404):
             raise StorageOperationError(f"Evidence deletion failed with status {resp.status_code}")
+
+
+def verification_max_bytes() -> int:
+    raw = os.getenv("CCTV_VERIFICATION_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_VERIFICATION_MAX_BYTES
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_VERIFICATION_MAX_BYTES
+    return max(1024, min(parsed, 20 * 1024 * 1024))
+
+
+def validate_verification_document_bytes(data: bytes, claimed_mime: str | None = None) -> tuple[str, str]:
+    """Validate actual file magic bytes and size; return (verified_mime, extension)."""
+    if not data:
+        raise ValueError("Uploaded document is empty")
+    limit = verification_max_bytes()
+    if len(data) > limit:
+        raise ValueError(f"Uploaded document exceeds maximum allowed size of {limit} bytes")
+
+    detected_mime: str | None = None
+    if data.startswith(b"%PDF-"):
+        detected_mime = "application/pdf"
+    elif data.startswith(b"\xff\xd8\xff"):
+        detected_mime = "image/jpeg"
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_mime = "image/png"
+
+    if detected_mime is None:
+        raise ValueError("Unsupported or malformed document content; only PDF, JPEG, and PNG are allowed")
+
+    if claimed_mime:
+        normalized_claimed = claimed_mime.split(";")[0].strip().lower()
+        if normalized_claimed == "image/jpg":
+            normalized_claimed = "image/jpeg"
+        if normalized_claimed and normalized_claimed != detected_mime:
+            raise ValueError("File content does not match declared MIME type")
+
+    return detected_mime, ALLOWED_VERIFICATION_MIME_TYPES[detected_mime]
+
+
+def build_verification_document_key(
+    applicant_user_id: str,
+    submission_version: int,
+    document_id: str,
+    extension: str,
+) -> str:
+    """Build a canonical, server-generated private storage key for an officer credential."""
+    try:
+        normalized_user = str(uuid.UUID(str(applicant_user_id).strip()))
+        normalized_doc = str(uuid.UUID(str(document_id).strip()))
+    except (ValueError, TypeError) as exc:
+        raise UnsafeStorageKeyError("applicant_user_id and document_id must be valid UUIDs") from exc
+    if submission_version < 1:
+        raise UnsafeStorageKeyError("submission_version must be >= 1")
+    ext = extension.strip().lower()
+    if ext not in {".pdf", ".jpg", ".png"}:
+        raise UnsafeStorageKeyError("Unsupported verification document extension")
+    return f"{normalized_user}/v{int(submission_version)}/{normalized_doc}{ext}"
+
+
+class SupabaseVerificationStorage(SupabaseEvidenceStorage):
+    """Privileged backend client for private officer verification credentials."""
+
+    def __init__(
+        self,
+        *,
+        supabase_url: str | None = None,
+        service_key: str | None = None,
+        bucket: str | None = None,
+        timeout: float = 20.0,
+    ) -> None:
+        resolved_bucket = (
+            bucket
+            if bucket is not None
+            else os.getenv("CCTV_VERIFICATION_BUCKET", DEFAULT_VERIFICATION_BUCKET)
+        ).strip() or DEFAULT_VERIFICATION_BUCKET
+        super().__init__(
+            supabase_url=supabase_url,
+            service_key=service_key,
+            bucket=resolved_bucket,
+            timeout=timeout,
+        )
+
+    def upload_document(self, storage_key: str, data: bytes, *, content_type: str) -> EvidenceUploadResult:
+        verified_mime, _ = validate_verification_document_bytes(data, content_type)
+        return self.upload_frame(storage_key, data, content_type=verified_mime)
+
+    def download_document(self, storage_key: str) -> bytes:
+        return self.download_frame(storage_key)

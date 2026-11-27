@@ -265,8 +265,81 @@ def initialize() -> None:
                 kind TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS districts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS profiles (
+                user_id TEXT PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                designation TEXT NOT NULL,
+                police_station TEXT NOT NULL,
+                claimed_district_id TEXT NOT NULL REFERENCES districts(id),
+                approved_district_id TEXT REFERENCES districts(id),
+                employee_ref TEXT,
+                verification_status TEXT NOT NULL DEFAULT 'draft',
+                status_reason TEXT,
+                submission_version INTEGER NOT NULL DEFAULT 1,
+                submitted_at TEXT,
+                approved_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS district_admins (
+                user_id TEXT PRIMARY KEY,
+                district_id TEXT NOT NULL REFERENCES districts(id),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                provisioned_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS verification_documents (
+                id TEXT PRIMARY KEY,
+                applicant_user_id TEXT NOT NULL REFERENCES profiles(user_id) ON DELETE CASCADE,
+                document_type TEXT NOT NULL,
+                storage_key TEXT NOT NULL UNIQUE,
+                original_filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                submission_version INTEGER NOT NULL DEFAULT 1,
+                uploaded_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS verification_reviews (
+                id TEXT PRIMARY KEY,
+                applicant_user_id TEXT NOT NULL REFERENCES profiles(user_id),
+                admin_user_id TEXT NOT NULL,
+                district_id TEXT NOT NULL REFERENCES districts(id),
+                decision TEXT NOT NULL,
+                previous_status TEXT NOT NULL,
+                new_status TEXT NOT NULL,
+                reason TEXT,
+                request_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(applicant_user_id, request_key)
+            );
+            CREATE TABLE IF NOT EXISTS verification_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                district_id TEXT NOT NULL REFERENCES districts(id),
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
+        now_ts = utc_now()
+        for dist_id, dist_name in (
+            ("central-metro", "Central Metro District"),
+            ("north-division", "North Division"),
+            ("south-division", "South Division"),
+            ("east-division", "East Division"),
+            ("west-division", "West Division"),
+            ("harbor-zone", "Harbor & Transit Zone"),
+        ):
+            db.execute(
+                "INSERT OR IGNORE INTO districts(id,name,is_active,created_at) VALUES(?,?,1,?)",
+                (dist_id, dist_name, now_ts),
+            )
 
 
 def _migrate_registry(conn):
