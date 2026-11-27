@@ -362,7 +362,7 @@ export function AdminDashboard() {
                         </button>
                       </div>
                       {previewMime === "application/pdf" ? (
-                        <iframe title="Applicant Credential PDF" src={previewUrl} className="h-72 w-full rounded" />
+                        <iframe title="Applicant Credential PDF" src={previewUrl} sandbox="" className="h-72 w-full rounded" />
                       ) : (
                         <img
                           src={previewUrl}

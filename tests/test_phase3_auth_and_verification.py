@@ -92,7 +92,7 @@ class PhaseThreeAuthAndVerificationTests(unittest.TestCase):
 
         # Expired, wrong issuer, wrong audience, invalid role, non-UUID sub
         for bad_kwargs in [
-            {"exp_delta_seconds": -60},
+            {"exp_delta_seconds": -120},
             {"issuer": "https://evil.example/auth/v1"},
             {"audience": "wrong-aud"},
             {"role": "anon"},
@@ -336,6 +336,94 @@ class PhaseThreeAuthAndVerificationTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 403)
         self.assertIn("cannot review", resp.json()["detail"].lower())
+
+    def test_oversized_and_active_script_verification_documents_are_rejected(self):
+        seed_profile(OFFICER_1_ID, verification_status="draft", approved_district_id=None)
+        headers = bearer_headers(OFFICER_1_ID)
+        big = self.client.post(
+            "/api/v1/verification/documents",
+            headers=headers,
+            data={"document_type": "redacted_id"},
+            files={"file": ("big.pdf", b"%PDF-1.4\n" + b"0" * (5 * 1024 * 1024 + 32) + b"\n%%EOF\n", "application/pdf")},
+        )
+        self.assertEqual(big.status_code, 413)
+
+        js_pdf = self.client.post(
+            "/api/v1/verification/documents",
+            headers=headers,
+            data={"document_type": "redacted_id"},
+            files={"file": ("active.pdf", b"%PDF-1.4\n/OpenAction /JavaScript (alert(1))\n%%EOF\n", "application/pdf")},
+        )
+        self.assertEqual(js_pdf.status_code, 415)
+
+    def test_document_content_response_sets_sandbox_csp_and_verifies_integrity_hash(self):
+        seed_profile(OFFICER_1_ID, verification_status="draft", approved_district_id=None)
+        headers = bearer_headers(OFFICER_1_ID)
+        up = self.client.post(
+            "/api/v1/verification/documents",
+            headers=headers,
+            data={"document_type": "redacted_id"},
+            files={"file": ("id.pdf", PDF_BYTES, "application/pdf")},
+        )
+        self.assertEqual(up.status_code, 201)
+        doc_id = up.json()["document"]["id"]
+        ok = self.client.get(f"/api/v1/verification/documents/{doc_id}/content", headers=headers)
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(ok.headers.get("x-content-type-options"), "nosniff")
+        self.assertEqual(ok.headers.get("content-security-policy"), "sandbox; default-src 'none'")
+
+        # Tamper stored bytes -> integrity check fails with 500
+        key = next(iter(self.storage_objects))
+        self.storage_objects[key] = b"%PDF-1.4\ntampered\n%%EOF\n"
+        tampered = self.client.get(f"/api/v1/verification/documents/{doc_id}/content", headers=headers)
+        self.assertEqual(tampered.status_code, 500)
+
+    def test_additional_info_resubmit_and_reinstatement_lifecycle(self):
+        officer_headers = bearer_headers(OFFICER_1_ID)
+        admin_headers = bearer_headers(ADMIN_NORTH_ID)
+        seed_district_admin(ADMIN_NORTH_ID, district_id="north-division")
+        seed_profile(OFFICER_1_ID, verification_status="pending_review", claimed_district_id="north-division", approved_district_id=None)
+
+        req_info = self.client.post(
+            f"/api/v1/admin/applications/{OFFICER_1_ID}/decision",
+            headers={**admin_headers, "Idempotency-Key": "info-1"},
+            json={"decision": "additional_info_required", "reason": "Upload clearer ID scan"},
+        )
+        self.assertEqual(req_info.status_code, 200)
+        self.assertEqual(req_info.json()["profile"]["verification_status"], "additional_info_required")
+
+        # Resubmit after adding a document
+        up = self.client.post(
+            "/api/v1/verification/documents",
+            headers=officer_headers,
+            data={"document_type": "redacted_id"},
+            files={"file": ("clear.pdf", PDF_BYTES, "application/pdf")},
+        )
+        self.assertEqual(up.status_code, 201)
+        resub = self.client.post("/api/v1/verification/submit", headers=officer_headers)
+        self.assertEqual(resub.status_code, 200)
+        self.assertEqual(resub.json()["profile"]["verification_status"], "pending_review")
+
+        # Approve -> Suspend -> Reinstate
+        for step_key, decision, expected_status in [
+            ("app-1", "approved", "approved"),
+            ("susp-1", "suspended", "suspended"),
+            ("rein-1", "reinstated", "approved"),
+        ]:
+            resp = self.client.post(
+                f"/api/v1/admin/applications/{OFFICER_1_ID}/decision",
+                headers={**admin_headers, "Idempotency-Key": step_key},
+                json={"decision": decision, "reason": f"Lifecycle step {decision}"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["profile"]["verification_status"], expected_status)
+
+    def test_provision_admin_cli_validates_district_and_existing_user(self):
+        from scripts.provision_admin import main as provision_main
+        with patch("sys.argv", ["provision_admin.py", "--email", "nobody@example.com", "--district", "invalid-district"]):
+            with self.assertRaises(SystemExit) as ctx:
+                provision_main()
+            self.assertNotEqual(ctx.exception.code, 0)
 
 
 if __name__ == "__main__":

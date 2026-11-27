@@ -133,6 +133,7 @@ class SupabaseJwtVerifier:
                 algorithms=[alg],
                 audience=audience,
                 issuer=issuer,
+                leeway=60,
                 options={
                     "require": ["exp", "iat", "sub"],
                     "verify_exp": True,
@@ -158,12 +159,15 @@ class SupabaseJwtVerifier:
             raise HTTPException(status_code=401, detail="Authenticated user role required")
 
         email = claims.get("email")
-        user_meta = claims.get("user_metadata") if isinstance(claims.get("user_metadata"), dict) else {}
         app_meta = claims.get("app_metadata") if isinstance(claims.get("app_metadata"), dict) else {}
+        providers = app_meta.get("providers") if isinstance(app_meta.get("providers"), list) else []
+        # Never trust user-editable user_metadata for email verification; rely on authoritative
+        # top-level claim, server-controlled app_metadata, or active session amr when email
+        # confirmation is enforced by Supabase Auth.
         email_verified = bool(
             claims.get("email_verified")
-            or user_meta.get("email_verified")
             or app_meta.get("provider") == "email"
+            or "email" in providers
             or claims.get("amr")
         )
 

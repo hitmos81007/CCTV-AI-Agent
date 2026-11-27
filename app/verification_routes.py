@@ -1,7 +1,9 @@
 """Officer verification onboarding and district administrator review API routes."""
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -479,13 +481,17 @@ def get_verification_document_content(
             raise HTTPException(status_code=404, detail="Verification document not found")
 
     content = _load_verification_bytes(doc["storage_key"])
+    if hashlib.sha256(content).hexdigest() != doc["sha256"]:
+        raise HTTPException(status_code=500, detail="Stored verification document failed integrity hash check")
+    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', Path(doc["original_filename"]).name)[:120] or "document"
     return Response(
         content=content,
         media_type=doc["mime_type"],
         headers={
-            "Content-Disposition": f'inline; filename="{Path(doc["original_filename"]).name}"',
+            "Content-Disposition": f'inline; filename="{safe_name}"',
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox; default-src 'none'",
         },
     )
 

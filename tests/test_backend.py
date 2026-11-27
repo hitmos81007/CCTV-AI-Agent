@@ -291,12 +291,45 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
         self.assertEqual(self.client.get("/api/v1/sightings", headers=self.headers).json(), [])
 
-    def test_audit_chain_verifies_case_creation_and_detects_tampering(self):
+    def test_audit_chain_verifies_case_creation(self):
         self.make_case()
         self.assertTrue(db.verify_audit_chain())
+
+    def test_audit_chain_detects_payload_tampering(self):
+        self.make_case()
         with db.connection() as conn:
             conn.execute("UPDATE audit_log SET payload_json='{}' WHERE event_type='case_created'")
         self.assertFalse(db.verify_audit_chain())
+
+    def test_evidence_and_review_history_endpoints_work_for_owned_case(self):
+        self.make_case()
+        ev = self.client.get("/api/v1/evidence?case_id=SYNTH-CASE-1", headers=self.headers)
+        self.assertEqual(ev.status_code, 200)
+        self.assertEqual(ev.json(), [])
+        with db.connection() as conn:
+            conn.execute(
+                "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,recorded_at,sha256,byte_size,duration_seconds,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("v-hist", "SYNTH-CASE-1", "North", "CAM-N", "hist.mp4", "unused.mp4",
+                 "2026-11-22T10:00:00+00:00", "c" * 64, 1, 5.0, db.utc_now()),
+            )
+            conn.execute(
+                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("s-hist", "SYNTH-CASE-1", "worker-north", "North", "CAM-N", "v-hist",
+                 "2026-11-22T10:00:30+00:00", 30.0, 2, "car", "blue", "car", "[]", 2,
+                 0.9, 1.0, "d" * 64, "pending", db.utc_now()),
+            )
+        rev = self.client.post(
+            "/api/v1/sightings/s-hist/review",
+            headers=self.headers,
+            json={"decision": "not_relevant", "note": "Different vehicle model"},
+        )
+        self.assertEqual(rev.status_code, 200)
+        hist = self.client.get("/api/v1/sightings/s-hist/reviews", headers=self.headers)
+        self.assertEqual(hist.status_code, 200)
+        self.assertEqual(len(hist.json()), 1)
+        self.assertEqual(hist.json()[0]["decision"], "not_relevant")
 
     def test_missing_local_ollama_is_reported_without_fabricating_clues(self):
         self.make_case()

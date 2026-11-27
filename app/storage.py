@@ -200,10 +200,20 @@ def validate_verification_document_bytes(data: bytes, claimed_mime: str | None =
 
     detected_mime: str | None = None
     if data.startswith(b"%PDF-"):
+        lower_pdf = data.lower()
+        for dangerous in (b"/javascript", b"/js ", b"/js\n", b"/js\r", b"/launch", b"/openaction", b"/embeddedfile", b"<script"):
+            if dangerous in lower_pdf:
+                raise ValueError("PDF contains active or embedded script content that is not permitted")
+        if b"%%eof" not in lower_pdf[-1024:]:
+            raise ValueError("PDF file appears truncated or malformed")
         detected_mime = "application/pdf"
     elif data.startswith(b"\xff\xd8\xff"):
+        if b"<script" in data.lower():
+            raise ValueError("Image payload contains disallowed active script markers")
         detected_mime = "image/jpeg"
     elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        if b"<script" in data.lower():
+            raise ValueError("Image payload contains disallowed active script markers")
         detected_mime = "image/png"
 
     if detected_mime is None:

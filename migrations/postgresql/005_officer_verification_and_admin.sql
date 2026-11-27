@@ -141,6 +141,7 @@ AS $$
         SELECT 1
         FROM public.profiles p
         WHERE p.user_id = target_uid
+          AND p.user_id = auth.uid()
           AND p.verification_status = 'approved'
     );
 $$;
@@ -160,6 +161,20 @@ AS $$
           AND da.district_id = target_district
     );
 $$;
+
+REVOKE ALL ON FUNCTION public.is_approved_officer(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.is_active_district_admin(TEXT) FROM PUBLIC;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        REVOKE ALL ON FUNCTION public.is_approved_officer(UUID) FROM anon;
+        REVOKE ALL ON FUNCTION public.is_active_district_admin(TEXT) FROM anon;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        GRANT EXECUTE ON FUNCTION public.is_approved_officer(UUID) TO authenticated;
+        GRANT EXECUTE ON FUNCTION public.is_active_district_admin(TEXT) TO authenticated;
+    END IF;
+END $$;
 
 -- 9. Enable RLS on all new tables and revoke direct privileges
 ALTER TABLE public.districts ENABLE ROW LEVEL SECURITY;
