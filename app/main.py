@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -30,6 +31,9 @@ from .schemas import AnalyzeZoneRequest, AnalyzeZonesRequest, CameraCreate, Inve
 from .verification_routes import router as verification_router
 from .video_analysis import analyze_video
 
+
+if os.getenv("CCTV_ENV", "").strip().lower() != "test":
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 app = FastAPI(title="CCTV Investigation Agent API", version="0.2.0")
 logger = logging.getLogger("cctv.api")

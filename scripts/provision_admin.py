@@ -38,7 +38,8 @@ def main() -> int:
                     "Create and confirm the user in Supabase Auth first."
                 )
             user_id = str(uuid.UUID(str(user_row[0])))
-            if not user_row[1]:
+            require_email = os.getenv("SUPABASE_REQUIRE_EMAIL_VERIFICATION", "false").strip().lower() == "true"
+            if require_email and not user_row[1]:
                 raise SystemExit(f"User {email} has not confirmed their email address yet.")
 
             cur.execute("SELECT id, is_active FROM public.districts WHERE id = %s", (district_id,))

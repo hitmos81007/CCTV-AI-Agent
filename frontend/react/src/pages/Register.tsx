@@ -1,21 +1,24 @@
 import React, { useState } from "react";
-import { Link } from "react-router-dom";
-import { CheckCircle2, Mail, ShieldCheck } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
+import { ShieldCheck } from "lucide-react";
+import { useAuth } from "../auth/AuthProvider";
 import { supabase } from "../lib/supabase";
 
 export function Register() {
+  const { refreshMe } = useAuth();
+  const navigate = useNavigate();
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [registeredEmail, setRegisteredEmail] = useState<string | null>(null);
-  const [resendMessage, setResendMessage] = useState("");
+  const [notice, setNotice] = useState("");
 
   const handleSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setNotice("");
     if (!supabase) {
       setError("Supabase authentication is not configured.");
       return;
@@ -39,7 +42,6 @@ export function Register() {
         password,
         options: {
           data: { full_name: fullName.trim() },
-          emailRedirectTo: `${window.location.origin}/auth/callback`,
         },
       });
       if (signUpErr) {
@@ -50,29 +52,14 @@ export function Register() {
         setError("An account with this email may already exist. Try signing in or resetting your password.");
         return;
       }
-      setRegisteredEmail(email.trim());
+      if (data.session) {
+        await refreshMe();
+        navigate("/onboarding", { replace: true });
+        return;
+      }
+      setNotice("Account created. Sign in below to continue to Professional Details and Credential Upload.");
     } catch {
       setError("Network error while creating account. Please retry.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleResend = async () => {
-    if (!supabase || !registeredEmail) return;
-    setResendMessage("");
-    setBusy(true);
-    try {
-      const { error: resendErr } = await supabase.auth.resend({
-        type: "signup",
-        email: registeredEmail,
-        options: { emailRedirectTo: `${window.location.origin}/auth/callback` },
-      });
-      if (resendErr) {
-        setResendMessage("Unable to resend right now (provider rate limits may apply). Wait a minute and retry.");
-      } else {
-        setResendMessage("Verification email resent. Check your inbox and spam folder.");
-      }
     } finally {
       setBusy(false);
     }
@@ -88,7 +75,7 @@ export function Register() {
           <div>
             <h1 className="text-xl font-semibold text-[#F1F5F9]">Officer Registration</h1>
             <p className="text-xs text-[#A8B6C9]">
-              Step 1 of 3 • Account Creation &amp; Email Verification
+              Step 1 of 3 • Account Creation
             </p>
           </div>
         </div>
@@ -106,116 +93,90 @@ export function Register() {
           </li>
         </ol>
 
-        {registeredEmail ? (
-          <div className="space-y-4">
-            <div className="rounded-xl border border-emerald-500/40 bg-emerald-950/30 p-4">
-              <div className="flex items-center gap-2 text-sm font-semibold text-[#5EE0AD]">
-                <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
-                <span>Confirm your email address</span>
-              </div>
-              <p className="mt-2 text-xs leading-relaxed text-[#A8B6C9]">
-                We sent a verification link to <strong className="text-[#F1F5F9]">{registeredEmail}</strong>.
-                Click the link in your email, then sign in to complete Step 2 (Professional Details) and
-                Step 3 (Supporting Credential Upload).
-              </p>
-              <p className="mt-2 text-xs text-[#F7BF62]">
-                Email verification alone does not grant investigation access; District Administrator approval
-                is required after document submission.
-              </p>
+        <form onSubmit={handleSignUp} className="space-y-4">
+          {error && (
+            <div role="alert" className="rounded-lg border border-rose-500/40 bg-rose-950/40 p-3 text-xs text-[#FF9CA9]">
+              {error}
             </div>
+          )}
 
-            {resendMessage && (
-              <p className="rounded-lg border border-[#33465A] bg-[#0B111C] p-3 text-xs text-[#A8B6C9]">
-                {resendMessage}
-              </p>
-            )}
-
-            <div className="flex flex-col gap-3 sm:flex-row">
-              <button
-                type="button"
-                disabled={busy}
-                onClick={handleResend}
-                className="flex items-center justify-center gap-2 rounded-lg border border-[#33465A] px-4 py-2.5 text-xs font-medium text-[#F1F5F9] hover:bg-[#1B2A3D] disabled:opacity-50"
-              >
-                <Mail className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Resend Verification Email</span>
-              </button>
-              <Link
-                to="/login"
-                className="flex-1 rounded-lg bg-[#5EE0CA] px-4 py-2.5 text-center text-xs font-semibold text-[#082D2D] hover:bg-[#78E5DC]"
-              >
+          {notice && (
+            <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/30 p-3 text-xs text-[#5EE0AD]">
+              <p>{notice}</p>
+              <Link to="/login" className="mt-2 inline-block font-semibold text-[#5EE0CA] hover:underline">
                 Proceed to Sign In
               </Link>
             </div>
+          )}
+
+          <label className="block text-xs font-medium text-[#A8B6C9]">
+            Full Name
+            <input
+              type="text"
+              required
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              placeholder="Inspector A. Sharma"
+              className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
+            />
+          </label>
+
+          <label className="block text-xs font-medium text-[#A8B6C9]">
+            Official Email Address
+            <input
+              type="email"
+              autoComplete="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="officer@department.gov"
+              className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
+            />
+          </label>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <label className="block text-xs font-medium text-[#A8B6C9]">
+              Password
+              <input
+                type="password"
+                autoComplete="new-password"
+                required
+                minLength={8}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Min 8 characters"
+                className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
+              />
+            </label>
+
+            <label className="block text-xs font-medium text-[#A8B6C9]">
+              Confirm Password
+              <input
+                type="password"
+                autoComplete="new-password"
+                required
+                minLength={8}
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="Re-enter password"
+                className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
+              />
+            </label>
           </div>
-        ) : (
-          <form onSubmit={handleSignUp} className="space-y-4">
-            {error && (
-              <div role="alert" className="rounded-lg border border-rose-500/40 bg-rose-950/40 p-3 text-xs text-[#FF9CA9]">
-                {error}
-              </div>
-            )}
 
-            <label className="block text-xs font-medium text-[#A8B6C9]">
-              Full Name
-              <input
-                type="text"
-                required
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                placeholder="Inspector A. Sharma"
-                className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
-              />
-            </label>
+          <p className="rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-[11px] leading-relaxed text-[#A8B6C9]">
+            Account creation alone does not grant investigation access. After signing up, you will
+            submit professional details and supporting credentials for District Administrator approval.
+          </p>
 
-            <label className="block text-xs font-medium text-[#A8B6C9]">
-              Official Email Address
-              <input
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="officer@department.gov"
-                className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
-              />
-            </label>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <label className="block text-xs font-medium text-[#A8B6C9]">
-                Password (min 8 chars)
-                <input
-                  type="password"
-                  autoComplete="new-password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
-                />
-              </label>
-
-              <label className="block text-xs font-medium text-[#A8B6C9]">
-                Confirm Password
-                <input
-                  type="password"
-                  autoComplete="new-password"
-                  required
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-[#33465A] bg-[#0B111C] px-3 py-2 text-sm text-[#F1F5F9]"
-                />
-              </label>
-            </div>
-
-            <button
-              type="submit"
-              disabled={busy}
-              className="w-full rounded-lg bg-[#5EE0CA] py-2.5 text-sm font-semibold text-[#082D2D] hover:bg-[#78E5DC] disabled:opacity-50"
-            >
-              {busy ? "Creating Account..." : "Create Account & Send Verification"}
-            </button>
-          </form>
-        )}
+          <button
+            type="submit"
+            disabled={busy}
+            className="w-full rounded-lg bg-[#5EE0CA] px-4 py-2.5 text-sm font-semibold text-[#082D2D] transition-colors hover:bg-[#78E5DC] disabled:opacity-50"
+          >
+            {busy ? "Creating Account..." : "Create Account & Continue"}
+          </button>
+        </form>
 
         <div className="mt-6 border-t border-[#33465A] pt-4 text-center text-xs text-[#A8B6C9]">
           Already registered?{" "}

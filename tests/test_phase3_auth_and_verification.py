@@ -103,8 +103,23 @@ class PhaseThreeAuthAndVerificationTests(unittest.TestCase):
                 resp = self.client.get("/api/v1/auth/me", headers=bearer_headers(user_id, **bad_kwargs))
                 self.assertEqual(resp.status_code, 401)
 
-        # Unverified email cannot submit profile or access investigations
+        # Unverified email: allowed to onboard in MVP mode, blocked when strict flag is enabled, and ALWAYS blocked from investigations
         unverified = bearer_headers(OFFICER_1_ID, email_verified=False)
+        with patch.dict(os.environ, {"SUPABASE_REQUIRE_EMAIL_VERIFICATION": "true"}):
+            self.assertEqual(
+                self.client.put(
+                    "/api/v1/verification/profile",
+                    headers=unverified,
+                    json={
+                        "full_name": "Test Officer",
+                        "designation": "Inspector",
+                        "police_station": "Central",
+                        "claimed_district_id": "north-division",
+                    },
+                ).status_code,
+                403,
+            )
+        seed_profile(OFFICER_1_ID, verification_status="pending_review", approved_district_id=None)
         self.assertEqual(
             self.client.put(
                 "/api/v1/verification/profile",
@@ -116,8 +131,10 @@ class PhaseThreeAuthAndVerificationTests(unittest.TestCase):
                     "claimed_district_id": "north-division",
                 },
             ).status_code,
-            403,
+            409,  # Reached profile handler (not blocked by email gate), rejected only because pending_review locks edits
         )
+        self.assertEqual(self.client.get("/api/v1/cases", headers=unverified).status_code, 403)
+        seed_profile(OFFICER_1_ID, verification_status="approved", approved_district_id="north-division")
 
         # Key rotation: first fetch returns old JWKS, unknown kid-2 triggers force_refresh=True
         with patch.object(

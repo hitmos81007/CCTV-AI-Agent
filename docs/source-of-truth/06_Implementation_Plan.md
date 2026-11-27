@@ -43,14 +43,14 @@ Baseline source: uploaded `CCTV-AI-Agent.zip`; repo `https://github.com/hitmos81
 
 **Goal:** Replace shared credentials with Supabase Auth, multi-step police officer registration & credential verification, district-scoped administrative approval/suspension, and a premium dark frontend for all auth/onboarding/admin/approved-shell screens.
 
-- Add Supabase JS client and auth provider in React; officer self-registration (Account → Professional Details → Supporting Document Upload), email verification, resend verification, forgot/reset password, approval-status screen, protected routes, session restoration, logout and cache/subscription cleanup.
+- Add Supabase JS client and auth provider in React; officer self-registration (Account → immediate session → Professional Details → Supporting Document Upload), forgot/reset password, approval-status screen, protected routes, session restoration, logout and cache/subscription cleanup.
 - Add forward-only PostgreSQL migration `005` (`districts`, `profiles`, `district_admins`, `verification_documents`, `verification_reviews`, `verification_events`, plus Phase 2 audit same-case `recordings` and `orchestration_tasks` constraints) and private `officer-verification` Storage bucket.
 - Implement backend bearer JWT verification (JWKS + signature/issuer/audience/expiry/sub checks) with separate authorization dependencies (authenticated user, approved officer, active district admin, owned case, district-scoped admin action). Suspend/revoke takes effect immediately on subsequent backend requests. Disable insecure legacy routes (`/api/v1/zones/analyze`, `/api/v1/zone/analyze`, ONVIF/NVR, global `/api/v1/audit`, unrestricted camera registration) and CORS-linked Basic Auth bypass.
 - Build District Administrator shell and verification workspace with real database-backed counts, private document previews, confirmation dialogs with mandatory reasons, and server-side bootstrap provisioning script (`scripts/provision_admin.py`).
 
 **Done gate:** Two real officer accounts self-registered and tested end-to-end (pending denial, admin approval, two-officer isolation, rejection/suspension/reinstatement); admin cross-district and self-approval blocked; private `officer-verification` bucket verified; TypeScript, React build, Playwright, and backend security tests pass. Suggested commits separating specs, DB/storage, auth/RBAC, frontend, and tests.
 
-**Your action required:** Configure Supabase Email/Password Auth (self-registration + email confirmation enabled, site/redirect URLs), provision initial District Administrator via `scripts/provision_admin.py`, and test two real officer accounts through the frontend. Do not provide actual passwords in prompts.
+**Your action required:** Configure Supabase Email/Password Auth (self-registration enabled, mandatory email confirmation disabled for hackathon MVP to avoid SMTP limits, site/redirect URLs configured for password recovery), provision initial District Administrator via `scripts/provision_admin.py`, and test two real officer accounts through the frontend. Do not provide actual passwords in prompts.
 
 ### Phase 4 — Core feature 1: Case creation and multi-video ingestion (P0)
 

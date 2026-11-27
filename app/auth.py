@@ -6,10 +6,12 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 import jwt
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -46,6 +48,9 @@ class SupabaseJwtVerifier:
 
     def _supabase_url(self) -> str:
         url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+        if not url and os.getenv("CCTV_ENV", "").strip().lower() != "test":
+            load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+            url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
         if not url:
             raise HTTPException(status_code=503, detail="Authentication provider is not configured")
         return url
@@ -205,7 +210,8 @@ def require_authenticated_user(
 def require_verified_email_user(
     user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> AuthenticatedUser:
-    if not user.email_verified:
+    require_email = os.getenv("SUPABASE_REQUIRE_EMAIL_VERIFICATION", "false").strip().lower() == "true"
+    if require_email and not user.email_verified:
         raise HTTPException(status_code=403, detail="Email verification is required before continuing")
     return user
 

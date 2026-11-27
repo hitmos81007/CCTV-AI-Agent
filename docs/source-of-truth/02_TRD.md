@@ -8,7 +8,7 @@ Read the PRD and comparison PDF first. This is a target technical contract, not 
 | Layer | Use | Existing foundation / required changes |
 |---|---|---|
 | Frontend | React 19, TypeScript, Vite, existing React Router and TanStack Query, existing Tailwind/CSS | `frontend/react`; add `@supabase/supabase-js`; retain lockfile and compatible installed versions; no Next.js migration. |
-| Auth | Supabase Auth (email/password, self-registration + email verification) + backend administrative approval gate | Replace `setCredentials`, in-memory `logged`, Basic dependencies; validate bearer JWT via JWKS (or Auth server fallback) plus authoritative server-side `profiles` / `district_admins` status checks on every protected request. |
+| Auth | Supabase Auth (email/password, self-registration with immediate session; password recovery retained) + backend administrative approval gate | Replace `setCredentials`, in-memory `logged`, Basic dependencies; validate bearer JWT via JWKS (with `leeway=60`) plus authoritative server-side `profiles` / `district_admins` status checks on every protected request. Automatic email confirmation is never treated as proof of police identity. |
 | API | Python FastAPI, Pydantic, Uvicorn, httpx | `app/main.py`, `app/schemas.py`; reuse routes, introduce owner-safe response DTOs. |
 | Planner | LangGraph with existing Ollama structured clue parsing | `app/orchestration.py`, `app/ollama_client.py`; local model only sees description, validates supported object clues, no images or external data. |
 | Analysis | Existing YOLO11n weights, Ultralytics, OpenCV, ByteTrack | `app/video_analysis.py`, `requirements-video.txt`; retain within-video object processing, filter supported categories, no identity/plate matching. |

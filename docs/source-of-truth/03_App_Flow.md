@@ -9,11 +9,11 @@ All flows below are target behavior. Keep the application small: one authenticat
 |---|---|---|
 | `/` | Either | Wait for session restore; redirect by role/verification status (`/dashboard`, `/admin`, `/onboarding`, `/verification-status`, or `/login`). |
 | `/login` | Public | Email/password sign-in, forgot password, and link to officer self-registration (`/register`). |
-| `/register` | Public | Police officer account signup (Step 1), email verification instructions, and resend verification. |
+| `/register` | Public | Police officer account signup (Step 1) with immediate session handoff directly to `/onboarding`. |
 | `/onboarding` | Verified unapproved officer | Multi-step professional profile (Step 2) and synthetic/redacted supporting document upload (Step 3) + submit for review. |
 | `/verification-status` | Verified non-approved officer | Display submission date, status (`draft`, `pending_review`, `additional_info_required`, `rejected`, `suspended`), review notes/reasons, and authorized resubmission. |
 | `/reset-password` | Public / valid recovery session | Request reset email or set password on recovery link; generic confirmation to avoid account enumeration. |
-| `/auth/callback` | Auth flow | Finish valid email confirmation/recovery callback; redirect only to allowed local paths. |
+| `/auth/callback` | Auth flow | Finish password recovery/auth callback; redirect only to allowed local paths. |
 | `/dashboard` | Approved officer | Counts, recent and active cases; New investigation, View history. |
 | `/investigations/new` | Approved officer | Describe case, create draft, upload multiple files, Start Investigation. Existing `/create` redirects here. |
 | `/cases/:id` | Approved officer, owner | Overview, footage, actual agent activity, findings/review; draft can resume upload. |
