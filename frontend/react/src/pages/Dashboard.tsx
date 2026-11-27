@@ -1,33 +1,92 @@
 import React from "react";
-import {Link} from "react-router-dom";
-import {useQueries,useQuery} from "@tanstack/react-query";
-import {request} from "../api";
-import type {Case,Camera,Progress} from "../types";
-import {ErrorBox} from "../components/Common";
+import { Link } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { fetchCases } from "../api";
+import { EmptyState, ErrorBanner, MetricCard, PageHeader, StatusChip } from "../components/Ui";
 
-export function Dashboard(){
-  const cases=useQuery({queryKey:["cases"],queryFn:()=>request<Case[]>("/api/v1/cases")});
-  const cameras=useQuery({queryKey:["cameras"],queryFn:()=>request<Camera[]>("/api/v1/cameras")});
-  const health=useQuery({queryKey:["health"],queryFn:()=>request<{status:string;ollama_ready:boolean}>("/health"),retry:false});
-  const progress=useQueries({queries:(cases.data||[]).map(c=>({queryKey:["progress",c.case_id],queryFn:()=>request<Progress>("/api/v1/cases/"+encodeURIComponent(c.case_id)+"/progress")}))});
-  const loading=progress.some(q=>q.isLoading), failed=progress.some(q=>q.isError);
-  const jobs=progress.flatMap(q=>q.data?.jobs||[]);
-  const evidence=progress.reduce((sum,q)=>sum+(q.data?.sighting_count||0),0);
-  const jurisdictions=new Set((cases.data||[]).flatMap(c=>Object.keys(c.neighbors||{})));
-  const metric=(value:number)=>cases.isLoading||cases.isError||loading||failed?"—":String(value);
-  return <><h1>Investigation overview</h1><p className="muted">Live case, camera and processing information.</p>
-    <div className="metrics">
-      <article><span>Investigations</span><strong>{cases.data?.length??"—"}</strong></article>
-      <article><span>Cameras</span><strong>{cameras.data?.length??"—"}</strong></article>
-      <article><span>Jurisdictions</span><strong>{cases.data?jurisdictions.size:"—"}</strong></article>
-      <article><span>Evidence records</span><strong>{metric(evidence)}</strong></article>
-      <article><span>Queued jobs</span><strong>{metric(jobs.filter(j=>["queued","retrying"].includes(j.status)).length)}</strong></article>
-      <article><span>Running jobs</span><strong>{metric(jobs.filter(j=>["running","processing"].includes(j.status)).length)}</strong></article>
-      <article><span>Completed jobs</span><strong>{metric(jobs.filter(j=>j.status==="completed").length)}</strong></article>
+export function Dashboard() {
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: ["cases"],
+    queryFn: fetchCases,
+  });
+
+  const cases = data ?? [];
+  const activeCount = cases.filter((c) => ["planning", "queued", "running"].includes(c.status)).length;
+  const pendingFindings = cases.reduce((acc, c) => acc + (c.pending_finding_count || 0), 0);
+
+  return (
+    <div>
+      <PageHeader
+        title="Investigation Overview"
+        subtitle="Authorized officer workspace • Real-time backend metrics"
+        action={
+          <Link
+            to="/investigations/new"
+            className="inline-flex rounded-lg bg-[#5EE0CA] px-4 py-2 text-xs font-semibold text-[#082D2D] hover:bg-[#78E5DC]"
+          >
+            New Investigation
+          </Link>
+        }
+      />
+
+      {error && (
+        <ErrorBanner
+          message={(error as Error).message}
+          onRetry={() => refetch()}
+        />
+      )}
+
+      <div className="mb-6 grid gap-4 sm:grid-cols-3">
+        <MetricCard
+          label="Total Investigations"
+          value={error ? "Unavailable" : isLoading ? "—" : cases.length}
+        />
+        <MetricCard
+          label="Active Investigations"
+          value={error ? "Unavailable" : isLoading ? "—" : activeCount}
+        />
+        <MetricCard
+          label="Pending Findings"
+          value={error ? "Unavailable" : isLoading ? "—" : pendingFindings}
+        />
+      </div>
+
+      {!error && !isLoading && cases.length === 0 ? (
+        <EmptyState
+          title="No investigations yet"
+          description="Your officer verification is approved. Start a new investigation when you are ready to upload authorized footage."
+          action={
+            <Link
+              to="/investigations/new"
+              className="inline-flex rounded-lg bg-[#5EE0CA] px-4 py-2 text-xs font-semibold text-[#082D2D] hover:bg-[#78E5DC]"
+            >
+              Create First Investigation
+            </Link>
+          }
+        />
+      ) : (
+        <div className="rounded-xl border border-[#33465A] bg-[#142133] p-5">
+          <h2 className="mb-3 text-sm font-semibold text-[#F1F5F9]">Recent Investigations</h2>
+          <div className="divide-y divide-[#33465A]">
+            {cases.slice(0, 8).map((c) => (
+              <Link
+                key={c.case_id}
+                to={`/cases/${encodeURIComponent(c.case_id)}`}
+                className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm hover:bg-[#1B2A3D]/40"
+              >
+                <div className="min-w-0">
+                  <div className="font-medium text-[#F1F5F9]">{c.title || c.case_id}</div>
+                  <div className="truncate text-xs text-[#A8B6C9]">{c.description}</div>
+                </div>
+                <div className="flex items-center gap-3 text-xs">
+                  <StatusChip status={c.status} />
+                  <span className="tabular-nums text-[#A8B6C9]">{c.finding_count} findings</span>
+                </div>
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
-    <section><h2>Services</h2>{health.isLoading?<p>Checking backend…</p>:health.error?<ErrorBox error={health.error}/>:<p>Backend: {health.data?.status||"unknown"} · Ollama: {health.data?.ollama_ready?"available":"unavailable"}</p>}</section>
-    <section><h2>Recent investigations</h2><Link to="/create">Create investigation</Link>{cases.isLoading&&<p>Loading cases…</p>}<ErrorBox error={cases.error}/><ErrorBox error={cameras.error}/>{failed&&<p className="error">Some progress metrics are unavailable.</p>}{cases.data?.length===0&&<p>No cases yet.</p>}
-      {cases.data?.map(c=><Link className="row" key={c.case_id} to={"/cases/"+encodeURIComponent(c.case_id)}><strong>{c.case_id}</strong><span>{c.description}</span><span>{Object.keys(c.neighbors||{}).length} jurisdictions</span></Link>)}
-    </section>
-  </>;
+  );
 }
