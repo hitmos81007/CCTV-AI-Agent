@@ -115,7 +115,7 @@ def initialize() -> None:
                 camera_id TEXT NOT NULL,
                 original_name TEXT NOT NULL,
                 file_path TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
+                recorded_at TEXT,
                 sha256 TEXT NOT NULL,
                 byte_size INTEGER NOT NULL,
                 duration_seconds REAL NOT NULL DEFAULT 0,
@@ -190,9 +190,14 @@ def initialize() -> None:
             ("title", "TEXT"),
             ("authorized_at", "TEXT"),
             ("updated_at", "TEXT"),
+            ("idempotency_key", "TEXT"),
         ):
             if name not in case_columns:
                 db.execute("ALTER TABLE cases ADD COLUMN " + name + " " + definition)
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS cases_owner_idempotency_uidx "
+            "ON cases(owner_id, idempotency_key) WHERE owner_id IS NOT NULL AND idempotency_key IS NOT NULL"
+        )
         columns = {row["name"] for row in db.execute("PRAGMA table_info(videos)").fetchall()}
         for name, definition in (
             ("duration_seconds", "REAL NOT NULL DEFAULT 0"),
@@ -201,9 +206,17 @@ def initialize() -> None:
             ("storage_kind", "TEXT"),
             ("storage_key", "TEXT"),
             ("media_status", "TEXT NOT NULL DEFAULT 'ready'"),
+            ("width", "INTEGER"),
+            ("height", "INTEGER"),
+            ("fps", "REAL"),
+            ("codec", "TEXT"),
         ):
             if name not in columns:
                 db.execute("ALTER TABLE videos ADD COLUMN " + name + " " + definition)
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS videos_case_upload_key_uidx "
+            "ON videos(case_id, upload_key) WHERE upload_key IS NOT NULL"
+        )
         sighting_columns = {row["name"] for row in db.execute("PRAGMA table_info(sightings)").fetchall()}
         for name, definition in (
             ("subject_type", "TEXT NOT NULL DEFAULT 'vehicle'"),
