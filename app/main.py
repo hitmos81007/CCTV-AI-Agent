@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -26,8 +26,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
 from .auth import AuthenticatedUser, owned_case_or_404, require_approved_officer
+from .ingestion import validate_and_probe_uploaded_video
 from .ollama_client import OLLAMA_BASE_URL, parse_vehicle_clues
-from .schemas import AnalyzeZoneRequest, AnalyzeZonesRequest, CameraCreate, InvestigationStatusUpdate, NVRReplayCreate, RecordingCreate, CaseCreate, ClueParseRequest, ResolveWorkItemsRequest, ReviewDecision
+from .schemas import AnalyzeZoneRequest, AnalyzeZonesRequest, CameraCreate, CaseCreate, CaseUpdate, ClueParseRequest, InvestigationStatusUpdate, NVRReplayCreate, RecordingCreate, ResolveWorkItemsRequest, ReviewDecision
 from .verification_routes import router as verification_router
 from .video_analysis import analyze_video
 
@@ -63,10 +64,22 @@ if cors_origins:
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
     )
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "1024")) * 1024 * 1024
+DEFAULT_MAX_UPLOAD_MB = 200
+DEFAULT_MAX_CASE_VIDEOS = 10
+
+
+def _max_upload_bytes() -> int:
+    raw = os.getenv("MAX_UPLOAD_MB", str(DEFAULT_MAX_UPLOAD_MB)).strip()
+    mb = max(1, int(raw)) if raw else DEFAULT_MAX_UPLOAD_MB
+    return mb * 1024 * 1024
+
+
+def _max_case_videos() -> int:
+    raw = os.getenv("MAX_CASE_VIDEOS", str(DEFAULT_MAX_CASE_VIDEOS)).strip()
+    return max(1, min(50, int(raw))) if raw else DEFAULT_MAX_CASE_VIDEOS
 FOLLOWUP_THRESHOLD = float(os.getenv("FOLLOWUP_MATCH_THRESHOLD", "0.70"))
 VIDEO_WORKER_CONCURRENCY = max(1, min(4, int(os.getenv("VIDEO_WORKER_CONCURRENCY", "1"))))
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -326,20 +339,136 @@ async def start_investigation(request: CaseCreate, user: AuthenticatedUser = Dep
     _legacy_disabled()
 
 
+def _serialize_video(row: Any) -> dict[str, Any]:
+    return {
+        "video_source_id": row["video_source_id"],
+        "case_id": row["case_id"],
+        "jurisdiction": row["jurisdiction"],
+        "camera_id": row["camera_id"],
+        "source_label": row.get("source_label") if isinstance(row, dict) else (row["source_label"] if "source_label" in row.keys() else None),
+        "original_name": row["original_name"],
+        "recorded_at": str(row["recorded_at"]) if row["recorded_at"] else None,
+        "sha256": row["sha256"],
+        "byte_size": int(row["byte_size"]),
+        "duration_seconds": float(row["duration_seconds"] or 0.0),
+        "width": row["width"] if "width" in row.keys() else None,
+        "height": row["height"] if "height" in row.keys() else None,
+        "fps": float(row["fps"]) if ("fps" in row.keys() and row["fps"] is not None) else None,
+        "codec": row["codec"] if "codec" in row.keys() else None,
+        "media_status": row["media_status"] if "media_status" in row.keys() else "ready",
+        "created_at": str(row["created_at"]),
+    }
+
+
 @app.post("/api/v1/cases", status_code=201)
-def create_case(request: CaseCreate, user: AuthenticatedUser = Depends(require_approved_officer)):
+def create_case(
+    request: CaseCreate,
+    idempotency_key: str | None = Header(default=None, max_length=128),
+    user: AuthenticatedUser = Depends(require_approved_officer),
+):
     db.initialize()
     now = db.utc_now()
+    idem = (idempotency_key or request.idempotency_key or "").strip() or None
+    case_id = (request.case_id or "").strip() or f"CASE-{uuid.uuid4().hex[:10].upper()}"
+    neighbors = request.neighbors or {request.initial_zone: []}
+    clue_envelope = (
+        {"clue_notes": request.clue_notes, "incident_time_text": request.incident_time_text}
+        if (request.clue_notes or request.incident_time_text)
+        else None
+    )
     with db.connection() as conn:
-        existing = conn.execute("SELECT case_id FROM cases WHERE case_id=?", (request.case_id,)).fetchone()
+        if idem:
+            dup = conn.execute(
+                "SELECT case_id,title,description,clues_json,authorized_at,created_at,updated_at "
+                "FROM cases WHERE owner_id=? AND idempotency_key=?",
+                (user.user_id, idem),
+            ).fetchone()
+            if dup:
+                state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (dup["case_id"],)).fetchone()
+                return {
+                    "case_id": dup["case_id"],
+                    "title": dup["title"],
+                    "description": dup["description"],
+                    "status": state["status"] if state else "draft",
+                    "clues": json.loads(dup["clues_json"]) if dup["clues_json"] else None,
+                    "authorized_at": str(dup["authorized_at"]) if dup["authorized_at"] else None,
+                    "created_at": str(dup["created_at"]),
+                    "updated_at": str(dup["updated_at"]) if dup["updated_at"] else None,
+                    "idempotent": True,
+                }
+        existing = conn.execute("SELECT case_id FROM cases WHERE case_id=?", (case_id,)).fetchone()
         if existing:
             raise HTTPException(status_code=409, detail="case_id already exists")
         conn.execute(
-            "INSERT INTO cases(case_id,owner_id,description,initial_zone,neighbors_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (request.case_id, user.user_id, request.description, request.initial_zone, db.canonical_json(request.neighbors), now, now),
+            "INSERT INTO cases(case_id,owner_id,title,description,initial_zone,neighbors_json,clues_json,authorized_at,idempotency_key,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                case_id,
+                user.user_id,
+                request.title,
+                request.description,
+                request.initial_zone,
+                db.canonical_json(neighbors),
+                db.canonical_json(clue_envelope) if clue_envelope else None,
+                now,
+                idem,
+                now,
+                now,
+            ),
         )
-        db.audit(conn, "case_created", {"case_id": request.case_id, "owner_id": user.user_id})
-    return {"case_id": request.case_id, "status": "draft", "neighbors": request.neighbors, "created_at": now}
+        conn.execute(
+            "INSERT INTO investigation_states(case_id,status,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(case_id) DO NOTHING",
+            (case_id, "draft", now),
+        )
+        db.audit(conn, "case_created", {"case_id": case_id, "owner_id": user.user_id})
+    return {
+        "case_id": case_id,
+        "title": request.title,
+        "description": request.description,
+        "status": "draft",
+        "clues": clue_envelope,
+        "neighbors": neighbors,
+        "authorized_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+@app.patch("/api/v1/cases/{case_id}")
+def update_case_draft(
+    case_id: str,
+    request: CaseUpdate,
+    user: AuthenticatedUser = Depends(require_approved_officer),
+):
+    db.initialize()
+    now = db.utc_now()
+    with db.connection() as conn:
+        row = dict(owned_case_or_404(conn, case_id, user.user_id))
+        state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+        if state and state["status"] != "draft":
+            raise HTTPException(status_code=409, detail="Only draft investigations can be edited")
+        existing_clues = json.loads(row["clues_json"]) if row.get("clues_json") else {}
+        if request.clue_notes is not None:
+            existing_clues["clue_notes"] = request.clue_notes or None
+        if request.incident_time_text is not None:
+            existing_clues["incident_time_text"] = request.incident_time_text or None
+        new_title = request.title if request.title is not None else row.get("title")
+        new_desc = request.description if request.description is not None else row["description"]
+        clues_json = db.canonical_json(existing_clues) if existing_clues else None
+        conn.execute(
+            "UPDATE cases SET title=?, description=?, clues_json=?, updated_at=? WHERE case_id=? AND owner_id=?",
+            (new_title, new_desc, clues_json, now, case_id, user.user_id),
+        )
+        db.audit(conn, "case_updated", {"case_id": case_id, "owner_id": user.user_id})
+    return {
+        "case_id": case_id,
+        "title": new_title,
+        "description": new_desc,
+        "status": "draft",
+        "clues": existing_clues or None,
+        "updated_at": now,
+    }
 
 
 @app.get("/api/v1/cases")
@@ -376,18 +505,31 @@ def list_cases(user: AuthenticatedUser = Depends(require_approved_officer)):
 
 @app.get("/api/v1/cases/{case_id}")
 def get_case(case_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    db.initialize()
     with db.connection() as conn:
         row = dict(owned_case_or_404(conn, case_id, user.user_id))
         state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+        video_rows = conn.execute(
+            "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
+            "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
+            "FROM videos WHERE case_id=? ORDER BY created_at ASC",
+            (case_id,),
+        ).fetchall()
     return {
         "case_id": row["case_id"],
         "title": row.get("title"),
         "description": row["description"],
         "status": state["status"] if state else "draft",
         "clues": json.loads(row["clues_json"]) if row.get("clues_json") else None,
-        "authorized_at": row.get("authorized_at"),
-        "created_at": row["created_at"],
-        "updated_at": row.get("updated_at"),
+        "authorized_at": str(row["authorized_at"]) if row.get("authorized_at") else None,
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]) if row.get("updated_at") else None,
+        "videos": [_serialize_video(v) for v in video_rows],
+        "limits": {
+            "max_upload_bytes": _max_upload_bytes(),
+            "max_case_videos": _max_case_videos(),
+            "supported_extensions": sorted(ALLOWED_EXTENSIONS),
+        },
     }
 
 
@@ -553,75 +695,156 @@ async def transcribe_clue_audio(
 async def upload_video(
     user: AuthenticatedUser = Depends(require_approved_officer),
     case_id: str = Form(...),
-    jurisdiction: str = Form(...),
-    camera_id: str = Form(...),
-    recorded_at: str = Form(...),
     file: UploadFile = File(...),
+    jurisdiction: str | None = Form(default=None),
+    camera_id: str | None = Form(default=None),
+    source_label: str | None = Form(default=None),
+    recorded_at: str | None = Form(default=None),
+    upload_key: str | None = Form(default=None),
+    idempotency_key: str | None = Header(default=None, max_length=128),
 ):
     db.initialize()
-    suffix = Path(file.filename or "").suffix.lower()
+    safe_orig = Path(file.filename or "recording.mp4").name
+    suffix = Path(safe_orig).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail=f"Supported video extensions: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
-    try:
-        recorded = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="recorded_at must be an ISO-8601 timestamp") from exc
+
+    recorded_iso: str | None = None
+    if recorded_at and recorded_at.strip():
+        try:
+            recorded_iso = _iso(datetime.fromisoformat(recorded_at.strip().replace("Z", "+00:00")))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="recorded_at must be an ISO-8601 timestamp") from exc
+
+    idem_key = (upload_key or idempotency_key or "").strip() or None
+    max_videos = _max_case_videos()
+    max_bytes = _max_upload_bytes()
+
     with db.connection() as conn:
         case = owned_case_or_404(conn, case_id, user.user_id)
-        if jurisdiction not in _case_zones(case):
+        if idem_key:
+            existing_vid = conn.execute(
+                "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
+                "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
+                "FROM videos WHERE case_id=? AND upload_key=?",
+                (case_id, idem_key),
+            ).fetchone()
+            if existing_vid:
+                return {**_serialize_video(existing_vid), "status": "ready", "idempotent": True}
+        count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
+        if int(count_row["total"]) >= max_videos:
+            raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
+        resolved_zone = (jurisdiction or "").strip() or case["initial_zone"]
+        if resolved_zone not in _case_zones(case):
             raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
+
+    resolved_cam = (camera_id or "").strip() or f"CAM-{uuid.uuid4().hex[:8].upper()}"
+    clean_label = (source_label or "").strip()[:120] or safe_orig[:120]
     video_id = str(uuid.uuid4())
-    dest = db.EVIDENCE_DIR / f"{video_id}{suffix}"
+    case_dir = db.EVIDENCE_DIR / "cases" / case_id
+    case_dir.mkdir(parents=True, exist_ok=True)
+    dest = case_dir / f"{video_id}{suffix}"
+    storage_key = f"cases/{case_id}/{video_id}{suffix}"
     digest = hashlib.sha256()
     total = 0
     try:
         with dest.open("wb") as out:
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
-                if total > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Video exceeds configured upload limit")
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail=f"Video exceeds configured upload limit ({max_bytes // (1024 * 1024)} MB)")
                 digest.update(chunk)
                 out.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=422, detail="Uploaded video file is empty")
     except Exception:
         dest.unlink(missing_ok=True)
         raise
     finally:
         await file.close()
+
     sha = digest.hexdigest()
     try:
-        import cv2
+        probe = validate_and_probe_uploaded_video(dest, suffix)
+    except ValueError as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ImportError as exc:
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=503, detail="Install requirements-video.txt to accept video files") from exc
-    capture = cv2.VideoCapture(str(dest))
-    if not capture.isOpened():
-        capture.release()
-        dest.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail="Uploaded file could not be opened as a video")
-    fps = capture.get(cv2.CAP_PROP_FPS) or 0
-    frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-    duration_seconds = float(frame_count / fps) if fps > 0 else 0.0
-    capture.release()
+
+    now = db.utc_now()
     with db.connection() as conn:
+        if idem_key:
+            dup = conn.execute(
+                "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
+                "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
+                "FROM videos WHERE case_id=? AND upload_key=?",
+                (case_id, idem_key),
+            ).fetchone()
+            if dup:
+                dest.unlink(missing_ok=True)
+                return {**_serialize_video(dup), "status": "ready", "idempotent": True}
         conn.execute(
-            "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,recorded_at,sha256,byte_size,duration_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (video_id, case_id, jurisdiction, camera_id, Path(file.filename or "video").name, str(dest), _iso(recorded), sha, total, duration_seconds, db.utc_now()),
+            "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,"
+            "recorded_at,sha256,byte_size,duration_seconds,upload_key,source_label,storage_kind,storage_key,"
+            "media_status,width,height,fps,codec,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                video_id, case_id, resolved_zone, resolved_cam, safe_orig, str(dest),
+                recorded_iso, sha, total, probe["duration_seconds"], idem_key, clean_label,
+                "local_private", storage_key, "ready", probe["width"], probe["height"], probe["fps"], probe["codec"], now,
+            ),
         )
-        conn.execute("INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,video_source_id,recorded_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                     (video_id, case_id, camera_id, jurisdiction, "upload", video_id, _iso(recorded), "ready", db.utc_now()))
-        attached_followups = _attach_waiting_followups(conn, case_id, jurisdiction)
-        db.audit(conn, "video_registered", {"video_source_id": video_id, "case_id": case_id, "jurisdiction": jurisdiction, "camera_id": camera_id, "sha256": sha, "byte_size": total, "duration_seconds": duration_seconds})
-        if attached_followups:
-            db.audit(conn, "followup_video_attached", {"video_source_id": video_id, "followup_ids": attached_followups})
-    return {"video_source_id": video_id, "case_id": case_id, "jurisdiction": jurisdiction, "camera_id": camera_id, "recorded_at": _iso(recorded), "sha256": sha, "byte_size": total, "duration_seconds": duration_seconds, "status": "stored_locally"}
+        conn.execute(
+            "INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,video_source_id,recorded_at,status,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (video_id, case_id, resolved_cam, resolved_zone, "upload", video_id, recorded_iso, "ready", now),
+        )
+        conn.execute(
+            "INSERT INTO video_metadata(video_source_id,metadata_json) VALUES(?,?) "
+            "ON CONFLICT(video_source_id) DO UPDATE SET metadata_json=excluded.metadata_json",
+            (video_id, db.canonical_json(probe["metadata"])),
+        )
+        db.audit(
+            conn,
+            "video_registered",
+            {
+                "video_source_id": video_id,
+                "case_id": case_id,
+                "jurisdiction": resolved_zone,
+                "camera_id": resolved_cam,
+                "sha256": sha,
+                "byte_size": total,
+                "duration_seconds": probe["duration_seconds"],
+            },
+        )
+    return {
+        "video_source_id": video_id,
+        "case_id": case_id,
+        "jurisdiction": resolved_zone,
+        "camera_id": resolved_cam,
+        "source_label": clean_label,
+        "original_name": safe_orig,
+        "recorded_at": recorded_iso,
+        "sha256": sha,
+        "byte_size": total,
+        "duration_seconds": probe["duration_seconds"],
+        "width": probe["width"],
+        "height": probe["height"],
+        "fps": probe["fps"],
+        "codec": probe["codec"],
+        "media_status": "ready",
+        "status": "ready",
+        "created_at": now,
+    }
 
 
 @app.get("/api/v1/videos")
 def list_videos(case_id: str | None = None, jurisdiction: str | None = None, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
     query = (
-        "SELECT v.video_source_id,v.case_id,v.jurisdiction,v.camera_id,v.original_name,"
-        "v.recorded_at,v.sha256,v.byte_size,v.duration_seconds,v.created_at "
+        "SELECT v.video_source_id,v.case_id,v.jurisdiction,v.camera_id,v.source_label,v.original_name,"
+        "v.recorded_at,v.sha256,v.byte_size,v.duration_seconds,v.width,v.height,v.fps,v.codec,v.media_status,v.created_at "
         "FROM videos v JOIN cases c ON c.case_id=v.case_id WHERE c.owner_id=?"
     )
     params: list[str] = [user.user_id]
@@ -631,10 +854,39 @@ def list_videos(case_id: str | None = None, jurisdiction: str | None = None, use
     if jurisdiction:
         query += " AND v.jurisdiction=?"
         params.append(jurisdiction)
-    query += " ORDER BY v.recorded_at"
+    query += " ORDER BY v.created_at ASC"
     with db.connection() as conn:
         rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+    return [_serialize_video(row) for row in rows]
+
+
+@app.delete("/api/v1/videos/{video_source_id}")
+def delete_draft_video(video_source_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    db.initialize()
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT v.video_source_id,v.case_id,v.file_path,s.status AS case_status "
+            "FROM videos v JOIN cases c ON c.case_id=v.case_id "
+            "LEFT JOIN investigation_states s ON s.case_id=c.case_id "
+            "WHERE v.video_source_id=? AND c.owner_id=?",
+            (video_source_id, user.user_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Video not found")
+        if row["case_status"] and row["case_status"] != "draft":
+            raise HTTPException(status_code=409, detail="Only videos in draft investigations can be removed")
+        file_path = Path(row["file_path"])
+        conn.execute("DELETE FROM recordings WHERE video_source_id=?", (video_source_id,))
+        conn.execute("DELETE FROM video_metadata WHERE video_source_id=?", (video_source_id,))
+        conn.execute("DELETE FROM videos WHERE video_source_id=?", (video_source_id,))
+        db.audit(conn, "video_removed", {"video_source_id": video_source_id, "case_id": row["case_id"]})
+    try:
+        resolved = file_path.resolve(strict=False)
+        if resolved.is_relative_to(db.EVIDENCE_DIR.resolve(strict=False)):
+            resolved.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {"deleted": True, "video_source_id": video_source_id}
 
 
 @app.post("/api/v1/work-items/resolve")
@@ -643,7 +895,11 @@ def resolve_work_items(request: ResolveWorkItemsRequest, user: AuthenticatedUser
 
 
 @app.get("/api/v1/videos/{video_source_id}/file")
-def get_video_file(video_source_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+def get_video_file(
+    video_source_id: str,
+    range_header: str | None = Header(default=None, alias="Range"),
+    user: AuthenticatedUser = Depends(require_approved_officer),
+):
     db.initialize()
     with db.connection() as conn:
         row = conn.execute(
@@ -651,12 +907,64 @@ def get_video_file(video_source_id: str, user: AuthenticatedUser = Depends(requi
             "WHERE v.video_source_id=? AND c.owner_id=?",
             (video_source_id, user.user_id),
         ).fetchone()
-    if row is None or not Path(row["file_path"]).is_file():
+    if row is None:
         raise HTTPException(status_code=404, detail="Video not found")
-    return FileResponse(
-        row["file_path"],
-        media_type=mimetypes.guess_type(row["original_name"])[0] or "video/mp4",
-        headers={"Content-Disposition": "inline"},
+    video_path = Path(row["file_path"]).resolve(strict=False)
+    evidence_root = db.EVIDENCE_DIR.resolve(strict=False)
+    if not video_path.is_relative_to(evidence_root) or not video_path.is_file():
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    file_size = video_path.stat().st_size
+    media_type = mimetypes.guess_type(row["original_name"])[0] or "video/mp4"
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": "inline",
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if not range_header or not range_header.lower().startswith("bytes="):
+        return FileResponse(video_path, media_type=media_type, headers=base_headers)
+
+    spec = range_header[6:].split(",", 1)[0].strip()
+    if "-" not in spec:
+        raise HTTPException(status_code=416, detail="Invalid Range header")
+    start_str, end_str = spec.split("-", 1)
+    try:
+        if start_str == "":
+            suffix_len = int(end_str)
+            start = max(0, file_size - suffix_len)
+            end = file_size - 1
+        else:
+            start = int(start_str)
+            end = int(end_str) if end_str else file_size - 1
+    except ValueError as exc:
+        raise HTTPException(status_code=416, detail="Invalid Range header") from exc
+
+    if start < 0 or end >= file_size or start > end:
+        raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+
+    length = end - start + 1
+
+    def iter_range():
+        with video_path.open("rb") as fh:
+            fh.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = fh.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        iter_range(),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            **base_headers,
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(length),
+        },
     )
 
 

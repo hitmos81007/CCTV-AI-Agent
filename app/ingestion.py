@@ -16,7 +16,113 @@ import cv2
 
 from . import db
 
-ALLOWED_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv"}
+ALLOWED_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
+
+
+def resolve_ffprobe_path() -> str | None:
+    """Locate ffprobe from FFPROBE_PATH, PATH, or local user FFmpeg install."""
+    configured = os.getenv("FFPROBE_PATH", "").strip()
+    if configured and Path(configured).is_file():
+        return configured
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    local_app = os.getenv("LOCALAPPDATA", "").strip()
+    if local_app:
+        candidates = list((Path(local_app) / "ffmpeg").rglob("ffprobe.exe"))
+        if candidates:
+            return str(candidates[0])
+    return None
+
+
+def validate_video_container_header(path: Path, suffix: str) -> None:
+    """Reject non-video files masquerading with a video extension."""
+    with path.open("rb") as handle:
+        header = handle.read(64)
+    if len(header) < 12:
+        raise ValueError("Uploaded file is too small to be a valid video")
+    ext = suffix.lower()
+    if ext in {".mp4", ".mov", ".m4v"}:
+        if b"ftyp" not in header[:32] and header[4:8] not in {b"moov", b"mdat", b"wide", b"free"}:
+            raise ValueError("Uploaded file does not have a valid MP4/MOV container signature")
+    elif ext == ".avi":
+        if not (header.startswith(b"RIFF") and header[8:12] == b"AVI "):
+            raise ValueError("Uploaded file does not have a valid AVI container signature")
+    elif ext in {".mkv", ".webm"}:
+        if not header.startswith(b"\x1a\x45\xdf\xa3"):
+            raise ValueError("Uploaded file does not have a valid Matroska/WebM container signature")
+
+
+def validate_and_probe_uploaded_video(path: Path, suffix: str) -> dict:
+    """Validate container signature, decode a frame with OpenCV, and extract metadata."""
+    validate_video_container_header(path, suffix)
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise ValueError("Uploaded file could not be opened as a video")
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise ValueError("Uploaded video has no readable video frames")
+        if width <= 0 or height <= 0:
+            height, width = frame.shape[:2]
+        duration = float(frame_count / fps) if fps > 0 and frame_count > 0 else 0.0
+    finally:
+        capture.release()
+
+    codec: str | None = None
+    probe_payload: dict = {
+        "probe": "opencv",
+        "fps": fps,
+        "frame_count": frame_count,
+        "width": width,
+        "height": height,
+        "duration_seconds": duration,
+    }
+    ffprobe = resolve_ffprobe_path()
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            parsed = json.loads(result.stdout)
+            video_streams = [s for s in parsed.get("streams", []) if s.get("codec_type") == "video"]
+            if not video_streams:
+                raise ValueError("Uploaded file contains no video stream")
+            vs = video_streams[0]
+            width = int(vs.get("width") or width)
+            height = int(vs.get("height") or height)
+            codec = str(vs.get("codec_name") or "") or None
+            rate_raw = str(vs.get("avg_frame_rate") or vs.get("r_frame_rate") or "")
+            if "/" in rate_raw:
+                num, den = rate_raw.split("/", 1)
+                if float(den) > 0:
+                    fps = float(num) / float(den)
+            fmt_dur = parsed.get("format", {}).get("duration") or vs.get("duration")
+            if fmt_dur is not None:
+                duration = float(fmt_dur)
+            probe_payload = {"probe": "ffprobe", "data": parsed}
+        except ValueError:
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("FFprobe could not inspect the uploaded video") from exc
+
+    return {
+        "duration_seconds": round(max(0.0, duration), 3),
+        "width": width or None,
+        "height": height or None,
+        "fps": round(fps, 3) if fps > 0 else None,
+        "codec": codec,
+        "metadata": probe_payload,
+    }
 
 
 def _allowed_file(uri: str) -> Path:

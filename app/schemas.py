@@ -7,15 +7,24 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class CaseCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    case_id: str = Field(min_length=1, max_length=80)
+    case_id: str | None = Field(default=None, min_length=1, max_length=80)
+    title: str | None = Field(default=None, min_length=2, max_length=160)
     description: str = Field(min_length=3, max_length=4000)
-    initial_zone: str = Field(min_length=1, max_length=80)
-    neighbors: dict[str, list[str]] = Field(default_factory=dict)
+    clue_notes: str | None = Field(default=None, max_length=1000)
+    incident_time_text: str | None = Field(default=None, max_length=120)
+    authorized: bool = True
+    initial_zone: str = Field(default="upload-batch", min_length=1, max_length=80)
+    neighbors: dict[str, list[str]] | None = None
+    idempotency_key: str | None = Field(default=None, min_length=4, max_length=128)
 
     @model_validator(mode="after")
     def validate_jurisdictions(self):
+        if not self.authorized:
+            raise ValueError("Confirm that all footage for this investigation is authorized.")
+        if self.neighbors is None:
+            self.neighbors = {self.initial_zone: []}
         if not 1 <= len(self.neighbors) <= 6:
             raise ValueError("Define between one and six jurisdictions.")
         if self.initial_zone not in self.neighbors:
@@ -26,6 +35,15 @@ class CaseCreate(BaseModel):
             if len(adjacent) != len(set(adjacent)) or any(x not in self.neighbors or x == zone for x in adjacent):
                 raise ValueError("Neighbors must be distinct, defined jurisdictions other than the jurisdiction itself.")
         return self
+
+
+class CaseUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    title: str | None = Field(default=None, min_length=2, max_length=160)
+    description: str | None = Field(default=None, min_length=3, max_length=4000)
+    clue_notes: str | None = Field(default=None, max_length=1000)
+    incident_time_text: str | None = Field(default=None, max_length=120)
 
 
 class CameraCreate(BaseModel):
