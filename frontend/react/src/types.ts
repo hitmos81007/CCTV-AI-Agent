@@ -129,19 +129,57 @@ export interface CaseSummary {
   };
 }
 
+export interface ProgressJob {
+  id: string;
+  run_id?: string | null;
+  video_source_id: string | null;
+  source_label?: string | null;
+  worker_id: string;
+  status: string;
+  attempts: number;
+  error_detail?: string | null;
+  heartbeat_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  updated_at: string;
+}
+
+export interface ParsedClue {
+  vehicle_color?: string | null;
+  vehicle_type?: string | null;
+  distinctive_vehicle_features?: string[];
+  visual_targets?: { target_type: string; color?: string | null; attributes: string[] }[];
+  unsupported_requests?: string[];
+  event_time_text?: string | null;
+  origin_zone?: string | null;
+  parser?: string;
+}
+
 export interface Progress {
   case_id: string;
+  title?: string | null;
+  description?: string;
+  clue?: ParsedClue | null;
   status: string;
   status_updated_at: string | null;
-  sighting_count: number;
-  jobs: {
+  run?: {
     id: string;
-    video_source_id: string | null;
-    worker_id: string;
     status: string;
-    attempts: number;
+    input_video_ids: string[];
+    error_code?: string | null;
+    error_detail?: string | null;
+    started_at?: string | null;
+    finished_at?: string | null;
     updated_at: string;
-  }[];
+  } | null;
+  total_videos?: number;
+  queued_jobs?: number;
+  running_jobs?: number;
+  retrying_jobs?: number;
+  completed_jobs?: number;
+  failed_jobs?: number;
+  sighting_count: number;
+  jobs: ProgressJob[];
 }
 
 export interface Sighting {

@@ -18,7 +18,9 @@ import {
   createCase,
   deleteDraftVideo,
   fetchCase,
+  fetchCaseProgress,
   fetchVideoPlaybackBlob,
+  startInvestigation,
   updateCaseDraft,
   uploadCaseVideo,
 } from "../api";
@@ -92,6 +94,9 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
   const [previewClip, setPreviewClip] = useState<{ title: string; url: string } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [startingInvestigation, setStartingInvestigation] = useState(false);
+  const [startError, setStartError] = useState("");
+  const startKeyRef = useRef<string>(makeUuid());
 
   useEffect(() => {
     setActiveCaseId(initialCaseId);
@@ -129,7 +134,46 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
   }, [caseQuery.data]);
 
   useEffect(() => {
-    return () => {
+    const canStartInvestigation =
+    Boolean(activeCaseId) &&
+    isDraft &&
+    authorized &&
+    title.trim().length >= 2 &&
+    description.trim().length >= 3 &&
+    stats.readyCount > 0 &&
+    stats.inFlightCount === 0 &&
+    stats.failedCount === 0 &&
+    stats.queuedCount === 0 &&
+    !startingInvestigation;
+
+  const handleStartInvestigation = async () => {
+    if (!canStartInvestigation || !activeCaseId) return;
+    setStartError("");
+    setFormError("");
+    setStartingInvestigation(true);
+    try {
+      await startInvestigation(activeCaseId, startKeyRef.current);
+      setFormNotice("Investigation started. Processing jobs queued for independent AI workers.");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["case", activeCaseId] }),
+        queryClient.invalidateQueries({ queryKey: ["case-progress", activeCaseId] }),
+        queryClient.invalidateQueries({ queryKey: ["cases"] }),
+      ]);
+    } catch (err) {
+      setStartError((err as Error).message);
+      startKeyRef.current = makeUuid();
+    } finally {
+      setStartingInvestigation(false);
+    }
+  };
+
+  const progress = progressQuery.data;
+  const totalJobs = progress?.total_videos ?? progress?.jobs.length ?? 0;
+  const completedJobs = progress?.completed_jobs ?? 0;
+  const failedJobs = progress?.failed_jobs ?? 0;
+  const terminalJobs = completedJobs + failedJobs;
+
+  return () => {
       if (previewClip?.url) URL.revokeObjectURL(previewClip.url);
     };
   }, [previewClip]);
@@ -138,6 +182,27 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
   const maxCaseVideos = caseQuery.data?.limits?.max_case_videos ?? 10;
   const caseStatus = caseQuery.data?.status ?? "draft";
   const isDraft = !activeCaseId || caseStatus === "draft";
+
+  const progressQuery = useQuery({
+    queryKey: ["case-progress", activeCaseId],
+    queryFn: () => fetchCaseProgress(activeCaseId),
+    enabled: Boolean(activeCaseId) && !isDraft,
+    refetchInterval: (query) => {
+      const st = query.state.data?.status ?? caseStatus;
+      if (st === "completed" || st === "partially_completed" || st === "failed") {
+        return false;
+      }
+      return 2500;
+    },
+  });
+
+  useEffect(() => {
+    const pStatus = progressQuery.data?.status;
+    if (pStatus && pStatus !== caseStatus) {
+      void queryClient.invalidateQueries({ queryKey: ["case", activeCaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["cases"] });
+    }
+  }, [progressQuery.data?.status, caseStatus, activeCaseId, queryClient]);
 
   const handleSaveDraft = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -396,6 +461,45 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
       totalBytes,
     };
   }, [clips]);
+
+  const canStartInvestigation =
+    Boolean(activeCaseId) &&
+    isDraft &&
+    authorized &&
+    title.trim().length >= 2 &&
+    description.trim().length >= 3 &&
+    stats.readyCount > 0 &&
+    stats.inFlightCount === 0 &&
+    stats.failedCount === 0 &&
+    stats.queuedCount === 0 &&
+    !startingInvestigation;
+
+  const handleStartInvestigation = async () => {
+    if (!canStartInvestigation || !activeCaseId) return;
+    setStartError("");
+    setFormError("");
+    setStartingInvestigation(true);
+    try {
+      await startInvestigation(activeCaseId, startKeyRef.current);
+      setFormNotice("Investigation started. Processing jobs queued for independent AI workers.");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["case", activeCaseId] }),
+        queryClient.invalidateQueries({ queryKey: ["case-progress", activeCaseId] }),
+        queryClient.invalidateQueries({ queryKey: ["cases"] }),
+      ]);
+    } catch (err) {
+      setStartError((err as Error).message);
+      startKeyRef.current = makeUuid();
+    } finally {
+      setStartingInvestigation(false);
+    }
+  };
+
+  const progress = progressQuery.data;
+  const totalJobs = progress?.total_videos ?? progress?.jobs.length ?? 0;
+  const completedJobs = progress?.completed_jobs ?? 0;
+  const failedJobs = progress?.failed_jobs ?? 0;
+  const terminalJobs = completedJobs + failedJobs;
 
   return (
     <div className="space-y-6">
@@ -810,21 +914,146 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
 
           <div className="rounded-xl border border-[#33465A] bg-[#142133] p-6 space-y-4">
             <h2 className="border-b border-[#33465A] pb-3 text-base font-semibold text-[#F1F5F9]">
-              D. Investigation Submission
+              D. Investigation Execution
             </h2>
-            <p className="text-xs leading-relaxed text-[#A8B6C9]">
-              Your draft investigation and validated CCTV recordings are durably saved in your
-              private officer workspace. Parallel AI agent orchestration and GPU processing
-              connect in Phase 5.
-            </p>
-            <button
-              type="button"
-              disabled
-              title="Parallel AI orchestration connects in Phase 5"
-              className="w-full cursor-not-allowed rounded-lg border border-[#33465A] bg-[#0B111C] px-4 py-2.5 text-xs font-semibold text-[#A8B6C9] opacity-75"
-            >
-              Start Investigation (Phase 5)
-            </button>
+            {isDraft ? (
+              <>
+                <p className="text-xs leading-relaxed text-[#A8B6C9]">
+                  Once all selected CCTV clips are uploaded and validated, start the investigation
+                  to interpret your clue with local Ollama and queue one analysis job per recording.
+                </p>
+                {startError && <ErrorBanner message={startError} />}
+                <button
+                  type="button"
+                  disabled={!canStartInvestigation}
+                  onClick={() => void handleStartInvestigation()}
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#2563EB] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#1D4ED8] disabled:cursor-not-allowed disabled:bg-[#0B111C] disabled:text-[#A8B6C9] disabled:border disabled:border-[#33465A] disabled:opacity-75"
+                >
+                  {startingInvestigation ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      Starting Investigation...
+                    </>
+                  ) : (
+                    "Start Investigation"
+                  )}
+                </button>
+                {!canStartInvestigation && !startingInvestigation && (
+                  <p className="text-[11px] text-[#94A3B8]">
+                    {stats.readyCount === 0
+                      ? "Save draft and upload at least one valid recording to enable start."
+                      : stats.inFlightCount > 0
+                        ? "Wait for in-flight uploads to finish."
+                        : stats.failedCount > 0 || stats.queuedCount > 0
+                          ? "Resolve or remove pending/failed clip selections before starting."
+                          : "Confirm footage authorization and investigation details."}
+                  </p>
+                )}
+              </>
+            ) : (
+              <div className="space-y-4 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-[#A8B6C9]">Orchestration Status</span>
+                  <StatusChip status={progress?.status ?? caseStatus} />
+                </div>
+
+                {progress?.run?.error_detail && (
+                  <ErrorBanner message={progress.run.error_detail} />
+                )}
+
+                <div className="rounded-lg border border-[#33465A] bg-[#0B111C] p-3 space-y-2">
+                  <div className="flex items-center justify-between text-[#A8B6C9]">
+                    <span>Completed Jobs</span>
+                    <span className="font-semibold tabular-nums text-[#F1F5F9]">
+                      {terminalJobs} / {totalJobs}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 pt-1 text-[11px]">
+                    <div className="flex justify-between text-[#A8B6C9]">
+                      <span>Queued</span>
+                      <span className="font-semibold text-[#F1F5F9]">{progress?.queued_jobs ?? 0}</span>
+                    </div>
+                    <div className="flex justify-between text-[#A8B6C9]">
+                      <span>Running</span>
+                      <span className="font-semibold text-[#5EE0CA]">{progress?.running_jobs ?? 0}</span>
+                    </div>
+                    <div className="flex justify-between text-[#A8B6C9]">
+                      <span>Completed</span>
+                      <span className="font-semibold text-[#5EE0AD]">{completedJobs}</span>
+                    </div>
+                    <div className="flex justify-between text-[#A8B6C9]">
+                      <span>Failed</span>
+                      <span className="font-semibold text-[#FF9CA9]">{failedJobs}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between border-t border-[#33465A] pt-2">
+                    <span className="text-[#A8B6C9]">Candidate Observations</span>
+                    <span className="font-semibold tabular-nums text-[#5EE0CA]">
+                      {progress?.sighting_count ?? 0}
+                    </span>
+                  </div>
+                </div>
+
+                {progress?.clue && (
+                  <div className="rounded-lg border border-[#33465A] bg-[#0B111C] p-3 space-y-1.5">
+                    <div className="font-semibold text-[#F1F5F9]">Parsed Supported Clue</div>
+                    {progress.clue.visual_targets && progress.clue.visual_targets.length > 0 ? (
+                      <ul className="space-y-1 text-[#A8B6C9]">
+                        {progress.clue.visual_targets.map((t, idx) => (
+                          <li key={idx}>
+                            • {t.color ? `${t.color} ` : ""}
+                            {t.target_type}
+                            {t.attributes.length > 0 ? ` (${t.attributes.join(", ")})` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="text-[#A8B6C9]">
+                        {progress.clue.vehicle_color ? `${progress.clue.vehicle_color} ` : ""}
+                        {progress.clue.vehicle_type || "Target"}
+                      </div>
+                    )}
+                    {progress.clue.unsupported_requests && progress.clue.unsupported_requests.length > 0 && (
+                      <div className="text-[11px] text-amber-300">
+                        Unsupported (ignored): {progress.clue.unsupported_requests.join(", ")}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  <div className="font-semibold text-[#F1F5F9]">Processing Agents &amp; Jobs</div>
+                  {progressQuery.isLoading ? (
+                    <div className="text-[#A8B6C9]">Loading worker status...</div>
+                  ) : !progress || progress.jobs.length === 0 ? (
+                    <div className="text-[#A8B6C9]">No processing jobs recorded yet.</div>
+                  ) : (
+                    <ul className="space-y-2">
+                      {progress.jobs.map((job) => (
+                        <li
+                          key={job.id}
+                          className="rounded-lg border border-[#33465A] bg-[#0B111C] p-2.5 space-y-1"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate font-medium text-[#F1F5F9]">
+                              {job.source_label || job.video_source_id || job.id}
+                            </span>
+                            <StatusChip status={job.status} />
+                          </div>
+                          <div className="flex items-center justify-between text-[11px] text-[#94A3B8]">
+                            <span className="truncate">Worker: {job.worker_id}</span>
+                            <span>Attempts: {job.attempts}</span>
+                          </div>
+                          {job.error_detail && (
+                            <div className="text-[11px] text-[#FF9CA9]">{job.error_detail}</div>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </aside>
       </div>

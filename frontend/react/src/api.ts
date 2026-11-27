@@ -289,6 +289,13 @@ export function fetchCaseProgress(caseId: string): Promise<Progress> {
   return apiRequest(`/api/v1/cases/${encodeURIComponent(caseId)}/progress`);
 }
 
+export function startInvestigation(caseId: string, idempotencyKey: string): Promise<Record<string, unknown>> {
+  return apiRequest(`/api/v1/cases/${encodeURIComponent(caseId)}/plan`, {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+  });
+}
+
 export function fetchSightings(caseId: string): Promise<Sighting[]> {
   return apiRequest(`/api/v1/sightings?case_id=${encodeURIComponent(caseId)}`);
 }
