@@ -242,14 +242,16 @@ def initialize() -> None:
             ("input_video_ids", "TEXT"),
             ("error_code", "TEXT"),
             ("error_detail", "TEXT"),
+            ("has_jobs", "INTEGER NOT NULL DEFAULT 0"),
             ("started_at", "TEXT"),
             ("finished_at", "TEXT"),
         ):
             if name not in run_columns:
                 db.execute("ALTER TABLE orchestration_runs ADD COLUMN " + name + " " + definition)
+        db.execute("DROP INDEX IF EXISTS orchestration_runs_active_case_uidx")
         db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS orchestration_runs_active_case_uidx "
-            "ON orchestration_runs(case_id) WHERE status <> 'failed'"
+            "ON orchestration_runs(case_id) WHERE NOT (status = 'failed' AND has_jobs = 0)"
         )
         db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS orchestration_runs_case_start_key_uidx "

@@ -138,8 +138,8 @@ def create_jobs(state: InvestigationState) -> dict:
 
         updated = {**state, "jobs": jobs, "status": "queued", "review_required": True}
         conn.execute(
-            "UPDATE orchestration_runs SET state_json=?, status='queued', started_at=?, updated_at=? WHERE id=?",
-            (db.canonical_json(updated), now, now, state["run_id"]),
+            "UPDATE orchestration_runs SET state_json=?, status='queued', has_jobs=?, started_at=?, updated_at=? WHERE id=?",
+            (db.canonical_json(updated), True, now, now, state["run_id"]),
         )
         conn.execute(
             "INSERT INTO investigation_states(case_id,status,updated_at) VALUES(?,?,?) "
@@ -193,11 +193,11 @@ async def plan_investigation(case_id: str, idempotency_key: str | None = None) -
         if int(ready_count) < 1:
             raise ValueError("Upload at least one ready video before starting the investigation")
 
-        # Check existing non-failed run for this case (exactly one MVP run per new case)
+        # Check existing non-recoverable run for this case (exactly one MVP run per new case)
         existing_run = conn.execute(
-            "SELECT id, start_key, status, state_json FROM orchestration_runs "
-            "WHERE case_id=? AND status <> 'failed' ORDER BY created_at DESC LIMIT 1",
-            (case_id,),
+            "SELECT id, start_key, status, has_jobs, state_json FROM orchestration_runs "
+            "WHERE case_id=? AND NOT (status = 'failed' AND has_jobs = ?) ORDER BY created_at DESC LIMIT 1",
+            (case_id, False),
         ).fetchone()
         if existing_run:
             if clean_key and existing_run["start_key"] == clean_key:

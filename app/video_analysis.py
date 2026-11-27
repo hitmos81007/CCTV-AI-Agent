@@ -39,9 +39,11 @@ def _dominant_color(frame, xyxy: list[float], target_type: str) -> str | None:
         return None
     if target_type == "person":
         # Approximate clothing color from the torso only; never inspect the head/face.
-        crop = frame[y1 + (y2 - y1) * 2 // 5 : y1 + (y2 - y1) * 4 // 5, x1:x2]
+        crop = frame[y1 + (y2 - y1) * 2 // 5 : y1 + (y2 - y1) * 4 // 5, x1 + (x2 - x1) // 5 : x2 - (x2 - x1) // 5]
     else:
-        crop = frame[y1 + (y2 - y1) // 3 : y2, x1:x2]
+        crop = frame[y1 + (y2 - y1) // 3 : y1 + (y2 - y1) * 3 // 4, x1 + (x2 - x1) // 5 : x2 - (x2 - x1) // 5]
+    if crop.size == 0:
+        crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return None
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -82,7 +84,7 @@ def analyze_video(path: str | Path, recorded_at: datetime | None, confidence: fl
     device = _resolve_device()
     tracks: dict[str, dict[str, Any]] = {}
     for frame_index, result in enumerate(
-        model.track(source=path, stream=True, tracker="bytetrack.yaml", device=device, conf=confidence, verbose=False)
+        model.track(source=path, stream=True, tracker="bytetrack.yaml", persist=False, device=device, conf=confidence, verbose=False)
     ):
         frame = result.orig_img
         offset_sec = frame_index / fps

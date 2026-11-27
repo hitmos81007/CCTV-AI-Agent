@@ -130,7 +130,8 @@ def _whisper_model():
 @app.on_event("startup")
 def startup() -> None:
     db.initialize()
-    _reconcile_incomplete_staged_uploads(max_age_seconds=0)
+    max_age = max(60, int(os.getenv("CCTV_STAGING_MAX_AGE_SECONDS", "3600")))
+    _reconcile_incomplete_staged_uploads(max_age_seconds=max_age)
 
 
 def _iso(value: datetime) -> str:
@@ -1123,7 +1124,7 @@ def get_sighting_frame(sighting_id: str, user: AuthenticatedUser = Depends(requi
     if row["frame_storage_key"]:
         try:
             storage = SupabaseEvidenceStorage()
-            data = storage.download_bytes(row["frame_storage_key"])
+            data = storage.download_frame(row["frame_storage_key"])
             return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
         except (StorageConfigError, StorageOperationError):
             pass
@@ -1140,11 +1141,31 @@ def analyze_zone(request: AnalyzeZoneRequest, user: AuthenticatedUser = Depends(
     _legacy_disabled()
 
 
+def _assert_job_lease(conn, job_id: str | None, lease_token: str | None) -> None:
+    if not job_id:
+        return
+    if isinstance(conn, db.PostgresConnection):
+        row = conn.execute(
+            "SELECT lease_expires_at FROM investigation_jobs WHERE id=? AND status='running' AND lease_token=? FOR UPDATE",
+            (job_id, lease_token),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT lease_expires_at FROM investigation_jobs WHERE id=? AND status='running' AND lease_token=?",
+            (job_id, lease_token),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("Processing lease was lost before evidence commit")
+    if row["lease_expires_at"] and str(row["lease_expires_at"]) < db.utc_now():
+        raise RuntimeError("Processing lease expired before evidence commit")
+
+
 def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_token: str | None = None):
     from .storage import StorageConfigError, SupabaseEvidenceStorage, build_evidence_frame_key
 
     db.initialize()
     with db.connection() as conn:
+        _assert_job_lease(conn, job_id, lease_token)
         case = _case_or_404(conn, request.case_id)
         if request.jurisdiction not in _case_zones(case):
             raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
@@ -1185,22 +1206,31 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
         raise HTTPException(status_code=503, detail=f"Video analysis failed: {type(exc).__name__}: {exc}") from exc
 
     sightings: list[dict[str, Any]] = []
+    supabase_storage_configured = bool(
+        os.getenv("SUPABASE_URL", "").strip()
+        and (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip() or os.getenv("SUPABASE_SECRET_KEY", "").strip())
+    )
     storage_client: SupabaseEvidenceStorage | None = None
     owner_id = dict(case).get("owner_id")
-    if owner_id:
-        try:
-            storage_client = SupabaseEvidenceStorage()
-        except StorageConfigError:
-            storage_client = None
+    if supabase_storage_configured and owner_id:
+        storage_client = SupabaseEvidenceStorage()
 
     with db.connection() as conn:
+        _assert_job_lease(conn, job_id, lease_token)
         for detection in detections:
+            _assert_job_lease(conn, job_id, lease_token)
             score = _match_score(detection, clue)
             if not _matches_machine_clue(detection, clue):
                 continue
             score = 1.0
             track_id = detection.get("track_id")
-            candidate_key = f"{request.video_source_id}:t{track_id}" if track_id is not None else None
+            frame_offset = float(detection.get("frame_offset_seconds", detection["start_offset_seconds"]))
+            subject_type = detection.get("subject_type") or detection.get("vehicle_type") or "vehicle"
+            candidate_key = (
+                f"{request.video_source_id}:t{track_id}"
+                if track_id is not None
+                else f"{request.video_source_id}:{subject_type}:{int(round(frame_offset * 1000))}"
+            )
             if job_id and candidate_key:
                 existing_cand = conn.execute(
                     "SELECT id FROM sightings WHERE job_id=? AND candidate_key=?",
@@ -1209,11 +1239,13 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
                 if existing_cand:
                     continue
 
-            sighting_id = str(uuid.uuid4())
-            subject_type = detection.get("subject_type") or detection.get("vehicle_type") or "vehicle"
+            sighting_id = (
+                str(uuid.uuid5(uuid.NAMESPACE_URL, f"sighting:{job_id}:{candidate_key}"))
+                if job_id and candidate_key
+                else str(uuid.uuid4())
+            )
             visual_attributes = detection.get("visual_attributes") or []
             frame_bytes = detection.get("frame_jpeg")
-            frame_offset = float(detection.get("frame_offset_seconds", detection["start_offset_seconds"]))
             occurred = _iso(recorded_dt + timedelta(seconds=frame_offset)) if recorded_dt is not None else None
             frame_path = None
             frame_sha256 = None
@@ -1225,16 +1257,13 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
                 frame_path.write_bytes(frame_bytes)
                 frame_sha256 = hashlib.sha256(frame_bytes).hexdigest()
                 if storage_client is not None and owner_id:
-                    try:
-                        frame_storage_key = build_evidence_frame_key(
-                            str(owner_id),
-                            request.case_id,
-                            request.video_source_id,
-                            sighting_id,
-                        )
-                        storage_client.upload_evidence_frame(frame_storage_key, frame_bytes)
-                    except Exception:
-                        frame_storage_key = None
+                    frame_storage_key = build_evidence_frame_key(
+                        str(owner_id),
+                        request.case_id,
+                        request.video_source_id,
+                        sighting_id,
+                    )
+                    storage_client.upload_frame(frame_storage_key, frame_bytes)
             integrity_payload = {
                 "video_sha256": video["sha256"],
                 "case_id": request.case_id,
@@ -1254,7 +1283,7 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
             evidence_hash = hashlib.sha256((video["sha256"] + db.canonical_json(integrity_payload)).encode("utf-8")).hexdigest()
             conn.execute(
                 "INSERT INTO sightings(id,case_id,job_id,candidate_key,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,clue_json,frame_path,frame_storage_key,frame_sha256,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
                 (
                     sighting_id,
                     request.case_id,

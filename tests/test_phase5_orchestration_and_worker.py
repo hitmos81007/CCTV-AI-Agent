@@ -303,6 +303,7 @@ class Phase5OrchestrationAndWorkerTests(unittest.TestCase):
         with patch("app.orchestration.parse_vehicle_clues", return_value=good_clue):
             self.client.post(f"/api/v1/cases/{case_id}/plan", headers={**self.h1, "Idempotency-Key": "real-3"})
 
+        self.assertEqual(len(list(range(1))), 1)
         for _ in range(3):
             self.assertTrue(worker.run_once(worker_id="real-cpu-worker"))
 
@@ -310,6 +311,87 @@ class Phase5OrchestrationAndWorkerTests(unittest.TestCase):
         self.assertEqual(progress["status"], "completed")
         self.assertEqual(progress["completed_jobs"], 3)
         self.assertEqual(progress["failed_jobs"], 0)
+
+    def test_task2_failed_run_with_jobs_blocks_second_run_and_color_evaluation(self):
+        # 1. Failed run that already created jobs (has_jobs=True) blocks a second MVP run
+        case_id, vids = self._create_case_with_videos(1, "Find a red car.")
+        good_clue = VehicleClue(
+            vehicle_color="red",
+            vehicle_type="car",
+            visual_targets=[{"target_type": "car", "color": "red", "attributes": []}],
+            source_text="Find a red car.",
+            parser="ollama:test",
+        )
+        with patch("app.orchestration.parse_vehicle_clues", return_value=good_clue):
+            self.client.post(f"/api/v1/cases/{case_id}/plan", headers={**self.h1, "Idempotency-Key": "t2-run-1"})
+        with patch("app.main.analyze_video", side_effect=RuntimeError("boom")):
+            for _ in range(worker.MAX_ATTEMPTS):
+                with db.connection() as conn:
+                    conn.execute("UPDATE investigation_jobs SET next_run_at=NULL WHERE video_source_id=?", (vids[0],))
+                worker.run_once(worker_id="t2-worker")
+        self.assertEqual(self.client.get(f"/api/v1/cases/{case_id}/progress", headers=self.h1).json()["status"], "failed")
+        with patch("app.orchestration.parse_vehicle_clues", return_value=good_clue):
+            second_start = self.client.post(
+                f"/api/v1/cases/{case_id}/plan",
+                headers={**self.h1, "Idempotency-Key": "t2-run-2"},
+            )
+        self.assertEqual(second_start.status_code, 409)
+
+        # 2. Ambiguous color ('dark') on person is normalized to None + human-review attribute
+        cleaned = _sanitize_clue_payload(
+            {
+                "visual_targets": [{"target_type": "person", "color": "dark", "attributes": ["scar"]}],
+                "vehicle_color": None,
+                "vehicle_type": None,
+                "distinctive_vehicle_features": [],
+                "unsupported_requests": [],
+                "event_time_text": None,
+                "origin_zone": None,
+            },
+            "Find a person in a dark jacket with a scar.",
+        )
+        self.assertIsNone(cleaned["visual_targets"][0]["color"])
+        self.assertIn("dark appearance (ambiguous)", cleaned["visual_targets"][0]["attributes"])
+        self.assertIn("scar", cleaned["unsupported_requests"])
+
+        # 3. Color evaluation rejects non-matching vehicle colors (blue car != red car)
+        from app.main import _matches_machine_clue
+        clue_dict = good_clue.model_dump()
+        self.assertTrue(_matches_machine_clue({"subject_type": "car", "vehicle_type": "car", "vehicle_color": "red"}, clue_dict))
+        self.assertFalse(_matches_machine_clue({"subject_type": "car", "vehicle_type": "car", "vehicle_color": "blue"}, clue_dict))
+
+        # 4. Supabase evidence upload failure is NOT silently swallowed when configured
+        from app.storage import StorageOperationError
+        case2_id, vids2 = self._create_case_with_videos(1, "Find a red car.")
+        with patch("app.orchestration.parse_vehicle_clues", return_value=good_clue):
+            self.client.post(f"/api/v1/cases/{case2_id}/plan", headers={**self.h1, "Idempotency-Key": "t2-stor"})
+        with db.connection() as conn:
+            j2 = conn.execute("SELECT id, request_json FROM investigation_jobs WHERE video_source_id=?", (vids2[0],)).fetchone()
+            conn.execute(
+                "UPDATE investigation_jobs SET status='running', attempts=1, lease_token='tok-stor', lease_expires_at=? WHERE id=?",
+                (worker.now_text(60), j2["id"]),
+            )
+        req2 = AnalyzeZoneRequest(**json.loads(j2["request_json"]))
+        fake_det = [
+            {
+                "track_id": 1,
+                "start_offset_seconds": 0.1,
+                "last_seen_at": None,
+                "vehicle_type": "car",
+                "vehicle_color": "red",
+                "subject_type": "car",
+                "visual_attributes": [],
+                "detector_confidence": 0.9,
+                "frame_jpeg": b"\xff\xd8\xff\xe0jpg",
+                "frame_offset_seconds": 0.1,
+            }
+        ]
+        with patch.dict(os.environ, {"SUPABASE_URL": TEST_SUPABASE_URL, "SUPABASE_SERVICE_ROLE_KEY": "secret-test-key"}):
+            with patch("app.main.analyze_video", return_value=fake_det):
+                with patch("app.storage.SupabaseEvidenceStorage.upload_frame", side_effect=StorageOperationError("bucket down")):
+                    with self.assertRaises(StorageOperationError):
+                        from app.main import _analyze_zone
+                        _analyze_zone(req2, job_id=j2["id"], lease_token="tok-stor")
 
 
 if __name__ == "__main__":

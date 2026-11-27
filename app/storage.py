@@ -133,7 +133,11 @@ class SupabaseEvidenceStorage:
         headers = self._headers({"Content-Type": content_type, "x-upsert": "false"})
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(url, headers=headers, content=data)
-        if resp.status_code not in (200, 201):
+        if resp.status_code == 409:
+            existing = self.download_frame(storage_key)
+            if hashlib.sha256(existing).hexdigest() != sha256:
+                raise StorageOperationError("Evidence object already exists with different content")
+        elif resp.status_code not in (200, 201):
             raise StorageOperationError(f"Evidence upload failed with status {resp.status_code}")
         return EvidenceUploadResult(
             bucket=self.bucket,

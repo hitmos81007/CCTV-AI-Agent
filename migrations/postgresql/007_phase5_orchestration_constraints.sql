@@ -1,8 +1,13 @@
 -- Phase 5: Orchestration run constraints, job lifecycle checks, and failure detail persistence.
 -- Forward-only migration extending 001..006 without modifying applied migrations.
 
--- 1. Orchestration runs: explicit failure detail and valid status constraints
+-- 1. Orchestration runs: explicit failure detail, job-creation flag, and valid status constraints
 ALTER TABLE public.orchestration_runs ADD COLUMN IF NOT EXISTS error_detail TEXT;
+ALTER TABLE public.orchestration_runs ADD COLUMN IF NOT EXISTS has_jobs BOOLEAN NOT NULL DEFAULT FALSE;
+
+UPDATE public.orchestration_runs r
+SET has_jobs = TRUE
+WHERE EXISTS (SELECT 1 FROM public.investigation_jobs j WHERE j.run_id = r.id);
 
 DO $$
 BEGIN
@@ -18,10 +23,10 @@ BEGIN
     END IF;
 END $$;
 
--- Enforce at most one active/non-failed MVP run per case (failed planning runs can be retried)
+-- Enforce one official MVP run per case; allow retry ONLY for failed planning runs with zero jobs
 CREATE UNIQUE INDEX IF NOT EXISTS orchestration_runs_active_case_uidx
     ON public.orchestration_runs(case_id)
-    WHERE status <> 'failed';
+    WHERE NOT (status = 'failed' AND has_jobs = FALSE);
 
 -- 2. Investigation jobs: valid status constraint
 DO $$

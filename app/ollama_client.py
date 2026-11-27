@@ -26,7 +26,12 @@ _UNSUPPORTED_TERMS = (
     "fingerprint",
     "cross-camera identity",
     "cross camera identity",
+    "scar",
+    "tattoo",
+    "suspicious",
+    "nervous",
 )
+_SUPPORTED_MACHINE_COLORS = {"black", "white", "gray", "grey", "red", "orange", "yellow", "green", "blue", "purple", "navy", "maroon", "crimson", "burgundy", "azure", "cyan"}
 _UNSAFE_PATTERN = re.compile(r"(https?://|file://|[A-Za-z]:\\|/\w+/|\.\./|\$\(|`)", re.IGNORECASE)
 _TIME_HINT_RE = re.compile(r"\b(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm)|morning|afternoon|evening|night|midnight|noon|today|yesterday)\b", re.IGNORECASE)
 
@@ -113,10 +118,16 @@ def _sanitize_clue_payload(parsed: dict, description: str) -> dict:
         if t_type == "person" and not any(w in desc_lower for w in ("person", "man", "woman", "pedestrian", "someone", "individual", "rider", "cyclist", "jacket", "shirt", "coat", "backpack", "bag")):
             continue
         t_color = target.get("color")
-        if isinstance(t_color, str) and (not _is_safe_text(t_color) or t_color.strip().casefold() not in desc_lower):
-            # Allow basic color synonyms if color word appears in description; otherwise do not invent color
-            t_color = t_color.strip() if t_color.strip().casefold() in desc_lower else None
         t_attrs = []
+        if isinstance(t_color, str):
+            c_low = t_color.strip().casefold()
+            if not _is_safe_text(t_color) or c_low not in desc_lower:
+                t_color = None
+            elif c_low not in _SUPPORTED_MACHINE_COLORS:
+                t_attrs.append(f"{t_color.strip()} appearance (ambiguous)")
+                t_color = None
+            else:
+                t_color = t_color.strip()
         for attr in target.get("attributes") or []:
             if not isinstance(attr, str) or not _is_safe_text(attr):
                 continue
@@ -141,12 +152,22 @@ def _sanitize_clue_payload(parsed: dict, description: str) -> dict:
     if isinstance(vehicle_type, str) and not _is_safe_text(vehicle_type):
         vehicle_type = None
 
+    # Filter unsupported_requests so the model cannot echo unrequested unsupported terms from the system prompt
+    verified_unsupported: list[str] = []
+    for item in unsupported:
+        if not isinstance(item, str) or not _is_safe_text(item):
+            continue
+        norm = item.strip().replace("_", " ")
+        tokens = [tok for tok in norm.casefold().split() if len(tok) > 2]
+        if tokens and any(tok in desc_lower for tok in tokens):
+            verified_unsupported.append(norm)
+
     return {
         "visual_targets": cleaned_targets,
         "vehicle_color": vehicle_color,
         "vehicle_type": vehicle_type,
         "distinctive_vehicle_features": cleaned_features,
-        "unsupported_requests": [u for u in unsupported if _is_safe_text(u)],
+        "unsupported_requests": verified_unsupported,
         "event_time_text": event_time_text,
         "origin_zone": origin_zone,
     }
