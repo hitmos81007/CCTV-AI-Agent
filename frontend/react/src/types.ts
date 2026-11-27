@@ -90,18 +90,43 @@ export interface AdminApplicationDetail {
   reviews: VerificationReview[];
 }
 
+export interface CaseVideo {
+  video_source_id: string;
+  case_id: string;
+  jurisdiction: string;
+  camera_id: string;
+  source_label: string | null;
+  original_name: string;
+  recorded_at: string | null;
+  sha256: string;
+  byte_size: number;
+  duration_seconds: number;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  codec: string | null;
+  media_status: string;
+  created_at: string;
+}
+
 export interface CaseSummary {
   case_id: string;
   title: string | null;
   description: string;
   status: string;
-  clues: unknown;
+  clues: { clue_notes?: string | null; incident_time_text?: string | null } | null;
   video_count: number;
   finding_count: number;
   pending_finding_count: number;
   authorized_at: string | null;
   created_at: string;
   updated_at: string | null;
+  videos?: CaseVideo[];
+  limits?: {
+    max_upload_bytes: number;
+    max_case_videos: number;
+    supported_extensions: string[];
+  };
 }
 
 export interface Progress {

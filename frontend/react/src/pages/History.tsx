@@ -56,6 +56,7 @@ export function History() {
               </div>
               <div className="flex items-center gap-3 text-xs">
                 <StatusChip status={c.status} />
+                <span className="tabular-nums text-[#A8B6C9]">{c.video_count} videos</span>
                 <span className="tabular-nums text-[#A8B6C9]">
                   {new Date(c.created_at).toLocaleDateString()}
                 </span>

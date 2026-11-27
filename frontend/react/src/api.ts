@@ -6,6 +6,7 @@ import type {
   AdminOverview,
   AuthMeResponse,
   CaseSummary,
+  CaseVideo,
   District,
   OfficerProfile,
   Progress,
@@ -166,16 +167,118 @@ export function fetchCases(): Promise<CaseSummary[]> {
   return apiRequest("/api/v1/cases");
 }
 
-export function createCase(payload: {
-  case_id: string;
-  description: string;
-  initial_zone: string;
-  neighbors: Record<string, string[]>;
-}): Promise<{ case_id: string; status: string }> {
+export function createCase(
+  payload: {
+    case_id?: string;
+    title?: string;
+    description: string;
+    clue_notes?: string | null;
+    incident_time_text?: string | null;
+    authorized: boolean;
+    initial_zone?: string;
+    neighbors?: Record<string, string[]>;
+  },
+  idempotencyKey?: string
+): Promise<CaseSummary> {
   return apiRequest("/api/v1/cases", {
     method: "POST",
+    headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
     body: JSON.stringify(payload),
   });
+}
+
+export function updateCaseDraft(
+  caseId: string,
+  payload: {
+    title?: string;
+    description?: string;
+    clue_notes?: string | null;
+    incident_time_text?: string | null;
+  }
+): Promise<CaseSummary> {
+  return apiRequest(`/api/v1/cases/${encodeURIComponent(caseId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function uploadCaseVideo(
+  caseId: string,
+  file: File,
+  options: {
+    uploadKey: string;
+    sourceLabel?: string;
+    recordedAt?: string | null;
+    onProgress?: (pct: number) => void;
+    signal?: AbortSignal;
+  }
+): Promise<CaseVideo> {
+  return new Promise((resolve, reject) => {
+    void (async () => {
+      try {
+        const token = await getAccessToken();
+        if (!token) {
+          reject(new Error("Session expired. Please sign in again."));
+          return;
+        }
+        const form = new FormData();
+        form.append("case_id", caseId);
+        form.append("upload_key", options.uploadKey);
+        if (options.sourceLabel?.trim()) form.append("source_label", options.sourceLabel.trim());
+        if (options.recordedAt?.trim()) form.append("recorded_at", options.recordedAt.trim());
+        form.append("file", file);
+
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `${apiBase}/api/v1/videos`);
+        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+        xhr.setRequestHeader("Idempotency-Key", options.uploadKey);
+        if (options.signal) {
+          options.signal.addEventListener("abort", () => {
+            xhr.abort();
+          });
+        }
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable && options.onProgress) {
+            options.onProgress(Math.round((ev.loaded / ev.total) * 100));
+          }
+        };
+        xhr.onabort = () => reject(new Error("Upload cancelled."));
+        xhr.onload = () => {
+          let parsed: Record<string, unknown> = {};
+          try {
+            parsed = JSON.parse(xhr.responseText || "{}");
+          } catch {
+            // ignore
+          }
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(parsed as unknown as CaseVideo);
+          } else {
+            const msg = typeof parsed.detail === "string" ? parsed.detail : `Video upload failed (${xhr.status})`;
+            reject(new Error(msg));
+          }
+        };
+        xhr.onerror = () => reject(new Error("Network error while uploading video."));
+        xhr.send(form);
+      } catch (err) {
+        reject(err);
+      }
+    })();
+  });
+}
+
+export function deleteDraftVideo(videoSourceId: string): Promise<{ deleted: boolean; video_source_id: string }> {
+  return apiRequest(`/api/v1/videos/${encodeURIComponent(videoSourceId)}`, { method: "DELETE" });
+}
+
+export async function fetchVideoPlaybackBlob(videoSourceId: string): Promise<Blob> {
+  const token = await getAccessToken();
+  const headers = new Headers();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const resp = await fetch(`${apiBase}/api/v1/videos/${encodeURIComponent(videoSourceId)}/file`, { headers });
+  if (!resp.ok) {
+    throw new Error(`Unable to load video playback stream (${resp.status}).`);
+  }
+  return resp.blob();
 }
 
 export function fetchCase(caseId: string): Promise<CaseSummary> {
