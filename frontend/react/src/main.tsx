@@ -70,6 +70,23 @@ function RequireAuthenticated({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+function RequireOnboardingApplicant({ children }: { children: React.ReactNode }) {
+  const { session, authLoading, me, meLoading } = useAuth();
+  const location = useLocation();
+  if (authLoading || (session && meLoading)) return <LoadingScreen />;
+  if (!session) {
+    const next = encodeURIComponent(location.pathname + location.search);
+    return <Navigate to={`/login?next=${next}`} replace />;
+  }
+  if (me?.is_district_admin) {
+    return <Navigate to="/admin" replace />;
+  }
+  if (me?.is_approved_officer) {
+    return <Navigate to="/dashboard" replace />;
+  }
+  return <>{children}</>;
+}
+
 function RequireApprovedOfficer({ children }: { children: React.ReactNode }) {
   const { session, authLoading, me, meLoading, signOut } = useAuth();
   if (authLoading || (session && meLoading)) return <LoadingScreen />;
@@ -155,17 +172,17 @@ function App() {
             <Route
               path="/onboarding"
               element={
-                <RequireAuthenticated>
+                <RequireOnboardingApplicant>
                   <Onboarding />
-                </RequireAuthenticated>
+                </RequireOnboardingApplicant>
               }
             />
             <Route
               path="/verification-status"
               element={
-                <RequireAuthenticated>
+                <RequireOnboardingApplicant>
                   <VerificationStatus />
-                </RequireAuthenticated>
+                </RequireOnboardingApplicant>
               }
             />
 
