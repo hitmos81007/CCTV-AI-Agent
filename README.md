@@ -10,17 +10,17 @@ An autonomous multi-agent CCTV investigation prototype for uploading authorized 
 
 This repository is undergoing phased consolidation toward the target MVP defined in `docs/source-of-truth/06_Implementation_Plan.md`:
 
-- **Current Phase 2 Baseline (Verified Locally & Against Supabase):**
-  - Official frontend consolidated to **React 19 + TypeScript + Vite** (`frontend/react/`).
+- **Current Phase 3 Baseline (Local Verified; Awaiting Owner Supabase Live Verification):**
+  - Official frontend consolidated to **React 19 + TypeScript + Vite** (`frontend/react/`) with dark operational command-center UI, Supabase Auth (`@supabase/supabase-js`), officer verification onboarding, and District Administrator review dashboard.
   - Isolated **Python 3.12** environment managed with `uv` (`requirements.txt`, `requirements-video.txt`).
-  - **FastAPI** backend (`app/main.py`) with ordered **PostgreSQL** migrations (`app/migrations.py`, `migrations/postgresql/001`–`004`), owner-scoped RLS, `case_events` Realtime table, and private `cctv-evidence` Supabase Storage (`app/storage.py`), plus isolated local **SQLite** test/dev compatibility.
+  - **FastAPI** backend (`app/main.py`, `app/auth.py`, `app/verification_routes.py`) with Supabase JWKS Bearer JWT verification, authoritative database approval/suspension checks, ordered **PostgreSQL** migrations (`app/migrations.py`, `migrations/postgresql/001`–`005`), district-scoped admin review, `case_events` + `verification_events` Realtime tables, private `cctv-evidence` and `officer-verification` Supabase Storage (`app/storage.py`), and disabled legacy prototype routes (`410 Gone`).
+  - **District Admin Provisioning:** Server-side CLI `scripts/provision_admin.py` (never via public signup).
   - **Ollama** (`llama3.2:latest`) structured clue parsing (`app/ollama_client.py`).
   - **YOLO11n + ByteTrack** (`app/video_analysis.py`, `yolo11n.pt`) running in **CPU inference mode** (`torch` CPU wheel).
 - **Upcoming Phases (Not Yet Implemented):**
-  - **Phase 3:** Supabase Auth (JWT bearer verification replacing HTTP Basic Auth).
   - **Phase 4:** Simplified case creation and batch multi-video upload UI (requires `ffmpeg`/`ffprobe`).
   - **Phase 5:** Multi-worker concurrency (`FOR UPDATE SKIP LOCKED`) and RTX 5050 Blackwell (`sm_120`) CUDA acceleration.
-  - **Phase 6–9:** Supabase Realtime subscriptions, human review history UI polish, end-to-end testing, and production deployment.
+  - **Phase 6–9:** Findings integration, human review history UI polish, end-to-end testing, and production deployment.
 
 ---
 
@@ -56,9 +56,9 @@ Copy `.env.example` to `.env` for local development (never commit `.env` or secr
 Copy-Item .env.example .env
 ```
 
-### 1b. Database Migrations (Supabase PostgreSQL)
+### 1b. Database Migrations & District Admin Provisioning (Supabase PostgreSQL)
 
-When `DATABASE_URL` is configured in `.env`, inspect and apply ordered PostgreSQL migrations (`migrations/postgresql/001`–`004`) using:
+When `DATABASE_URL` is configured in `.env`, inspect and apply ordered PostgreSQL migrations (`migrations/postgresql/001`–`005`) using:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app.migrations --status
@@ -66,9 +66,19 @@ When `DATABASE_URL` is configured in `.env`, inspect and apply ordered PostgreSQ
 .\.venv\Scripts\python.exe -m app.migrations --apply
 ```
 
-### 2. Frontend (React + Vite)
+To provision or revoke a District Administrator after the user has registered and verified their email in Supabase Auth:
 
 ```powershell
+.\.venv\Scripts\python.exe scripts/provision_admin.py --email admin@example.com --district north-division
+.\.venv\Scripts\python.exe scripts/provision_admin.py --email admin@example.com --district north-division --revoke
+```
+
+### 2. Frontend (React + Vite)
+
+Copy `frontend/react/.env.example` to `frontend/react/.env.local` and set `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`, then install dependencies:
+
+```powershell
+Copy-Item frontend/react/.env.example frontend/react/.env.local
 cd frontend/react
 npm ci
 ```
