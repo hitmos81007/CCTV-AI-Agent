@@ -646,8 +646,10 @@ async def plan_case(case_id: str, idempotency_key: str | None = Header(default=N
         with db.connection() as conn:
             owned_case_or_404(conn, case_id, user.user_id)
         try:
-            from .orchestration import plan_investigation
+            from .orchestration import InvestigationConflictError, plan_investigation
             return await plan_investigation(case_id, idempotency_key)
+        except InvestigationConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ImportError as exc:
@@ -660,30 +662,72 @@ async def plan_case(case_id: str, idempotency_key: str | None = Header(default=N
 
 @app.get("/api/v1/cases/{case_id}/progress")
 def case_progress(case_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    db.initialize()
     with db.connection() as conn:
-        owned_case_or_404(conn, case_id, user.user_id)
+        case = dict(owned_case_or_404(conn, case_id, user.user_id))
+        run_row = conn.execute(
+            "SELECT id, status, input_video_ids, error_code, started_at, finished_at, updated_at, state_json "
+            "FROM orchestration_runs WHERE case_id=? ORDER BY created_at DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        job_rows = conn.execute(
+            "SELECT j.id, j.run_id, j.video_source_id, j.worker_id, j.status, j.attempts, "
+            "j.error_detail, j.heartbeat_at, j.started_at, j.finished_at, j.updated_at, "
+            "v.source_label, v.original_name "
+            "FROM investigation_jobs j LEFT JOIN videos v ON v.video_source_id=j.video_source_id "
+            "WHERE j.case_id=? ORDER BY j.created_at",
+            (case_id,),
+        ).fetchall()
         jobs = [
             {
                 "id": row["id"],
+                "run_id": row["run_id"],
                 "video_source_id": row["video_source_id"],
+                "source_label": row["source_label"] or row["original_name"],
                 "worker_id": row["worker_id"],
                 "status": row["status"],
                 "attempts": int(row["attempts"] or 0),
-                "updated_at": row["updated_at"],
+                "error_detail": row["error_detail"],
+                "heartbeat_at": str(row["heartbeat_at"]) if row["heartbeat_at"] else None,
+                "started_at": str(row["started_at"]) if row["started_at"] else None,
+                "finished_at": str(row["finished_at"]) if row["finished_at"] else None,
+                "updated_at": str(row["updated_at"]),
             }
-            for row in conn.execute(
-                "SELECT id,video_source_id,worker_id,status,attempts,updated_at FROM investigation_jobs WHERE case_id=? ORDER BY created_at",
-                (case_id,),
-            ).fetchall()
+            for row in job_rows
         ]
         count = conn.execute("SELECT COUNT(*) AS total FROM sightings WHERE case_id=?", (case_id,)).fetchone()["total"]
         state = conn.execute("SELECT status,updated_at FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+    run_info = None
+    if run_row:
+        raw_ids = run_row["input_video_ids"]
+        input_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+        run_state = json.loads(run_row["state_json"]) if run_row["state_json"] else {}
+        run_info = {
+            "id": run_row["id"],
+            "status": run_row["status"],
+            "input_video_ids": input_ids or [],
+            "error_code": run_row["error_code"],
+            "error_detail": run_state.get("error_detail"),
+            "started_at": str(run_row["started_at"]) if run_row["started_at"] else None,
+            "finished_at": str(run_row["finished_at"]) if run_row["finished_at"] else None,
+            "updated_at": str(run_row["updated_at"]),
+        }
     return {
         "case_id": case_id,
+        "title": case.get("title"),
+        "description": case["description"],
+        "clue": json.loads(case["clues_json"]) if case.get("clues_json") else None,
         "status": state["status"] if state else "draft",
-        "status_updated_at": state["updated_at"] if state else None,
+        "status_updated_at": str(state["updated_at"]) if state else None,
+        "run": run_info,
+        "total_videos": len(run_info["input_video_ids"]) if (run_info and run_info["input_video_ids"]) else len(jobs),
+        "queued_jobs": sum(1 for j in jobs if j["status"] == "queued"),
+        "running_jobs": sum(1 for j in jobs if j["status"] == "running"),
+        "retrying_jobs": sum(1 for j in jobs if j["status"] == "retrying"),
+        "completed_jobs": sum(1 for j in jobs if j["status"] == "completed"),
+        "failed_jobs": sum(1 for j in jobs if j["status"] == "failed"),
         "jobs": jobs,
-        "sighting_count": count,
+        "sighting_count": int(count),
     }
 
 
@@ -1059,18 +1103,31 @@ def get_video_file(
 
 @app.get("/api/v1/sightings/{sighting_id}/frame")
 def get_sighting_frame(sighting_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    from fastapi.responses import Response
+    from .storage import StorageConfigError, StorageOperationError, SupabaseEvidenceStorage
+
     db.initialize()
     with db.connection() as conn:
         row = conn.execute(
-            "SELECT s.frame_path FROM sightings s JOIN cases c ON c.case_id=s.case_id "
+            "SELECT s.frame_path, s.frame_storage_key FROM sightings s JOIN cases c ON c.case_id=s.case_id "
             "WHERE s.id=? AND c.owner_id=?",
             (sighting_id, user.user_id),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    if not row["frame_path"] or not Path(row["frame_path"]).is_file():
-        raise HTTPException(status_code=404, detail="No still frame was captured for this stored candidate; rerun the clip search to create one")
-    return FileResponse(row["frame_path"], media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    evidence_root = db.EVIDENCE_DIR.resolve(strict=False)
+    if row["frame_path"]:
+        frame_path = Path(row["frame_path"]).resolve(strict=False)
+        if frame_path.is_relative_to(evidence_root) and frame_path.is_file():
+            return FileResponse(frame_path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    if row["frame_storage_key"]:
+        try:
+            storage = SupabaseEvidenceStorage()
+            data = storage.download_bytes(row["frame_storage_key"])
+            return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+        except (StorageConfigError, StorageOperationError):
+            pass
+    raise HTTPException(status_code=404, detail="No still frame was captured for this stored candidate; rerun the clip search to create one")
 
 
 @app.post("/api/v1/zones/analyze")
@@ -1084,6 +1141,8 @@ def analyze_zone(request: AnalyzeZoneRequest, user: AuthenticatedUser = Depends(
 
 
 def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_token: str | None = None):
+    from .storage import StorageConfigError, SupabaseEvidenceStorage, build_evidence_frame_key
+
     db.initialize()
     with db.connection() as conn:
         case = _case_or_404(conn, request.case_id)
@@ -1094,9 +1153,30 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
             raise HTTPException(status_code=404, detail="video_source_id is not registered in the local evidence store")
         if video["case_id"] != request.case_id or video["jurisdiction"] != request.jurisdiction:
             raise HTTPException(status_code=409, detail="Video case or jurisdiction does not match this worker assignment")
+        run_id = getattr(request, "run_id", None)
+        if job_id and not run_id:
+            job_row = conn.execute("SELECT run_id FROM investigation_jobs WHERE id=?", (job_id,)).fetchone()
+            run_id = job_row["run_id"] if job_row else None
+        if run_id:
+            run_row = conn.execute("SELECT input_video_ids FROM orchestration_runs WHERE id=?", (run_id,)).fetchone()
+            if run_row and run_row["input_video_ids"]:
+                raw_ids = run_row["input_video_ids"]
+                allowed_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else list(raw_ids)
+                if request.video_source_id not in allowed_ids:
+                    raise HTTPException(status_code=409, detail="Video does not belong to the reserved investigation snapshot")
         clue = request.clue.model_dump() if request.clue else (json.loads(case["clues_json"]) if case["clues_json"] else None)
+
+    evidence_root = db.EVIDENCE_DIR.resolve(strict=False)
+    video_path = Path(video["file_path"]).resolve(strict=False)
+    if not video_path.is_relative_to(evidence_root) or not video_path.is_file():
+        raise HTTPException(status_code=404, detail="Source video file is missing from private evidence storage")
+    actual_sha = hashlib.sha256(video_path.read_bytes()).hexdigest()
+    if actual_sha != video["sha256"]:
+        raise HTTPException(status_code=409, detail="Source video integrity check failed")
+
+    recorded_dt = datetime.fromisoformat(str(video["recorded_at"])) if video["recorded_at"] else None
     try:
-        detections = analyze_video(video["file_path"], datetime.fromisoformat(video["recorded_at"]), float(os.getenv("YOLO_CONFIDENCE", "0.30")))
+        detections = analyze_video(video_path, recorded_dt, float(os.getenv("YOLO_CONFIDENCE", "0.30")))
     except ImportError as exc:
         raise HTTPException(status_code=503, detail="OpenCV/Ultralytics are not installed; install requirements and configure YOLO") from exc
     except ValueError as exc:
@@ -1105,89 +1185,163 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
         raise HTTPException(status_code=503, detail=f"Video analysis failed: {type(exc).__name__}: {exc}") from exc
 
     sightings: list[dict[str, Any]] = []
-    followups: list[dict[str, Any]] = []
-    neighbor_map = json.loads(case["neighbors_json"])
-    neighbor_zones = list(dict.fromkeys([*request.neighbors, *neighbor_map.get(request.jurisdiction, [])]))
+    storage_client: SupabaseEvidenceStorage | None = None
+    owner_id = dict(case).get("owner_id")
+    if owner_id:
+        try:
+            storage_client = SupabaseEvidenceStorage()
+        except StorageConfigError:
+            storage_client = None
+
     with db.connection() as conn:
         for detection in detections:
             score = _match_score(detection, clue)
-            # Keep only actual type/color matches. Free-text marks/accessories remain for
-            # human review and are never claimed as machine-confirmed attributes.
             if not _matches_machine_clue(detection, clue):
                 continue
-            # Persist a normalized match indicator: every machine-readable type/color
-            # component passed. This is a clue filter, not a probability of identity.
             score = 1.0
+            track_id = detection.get("track_id")
+            candidate_key = f"{request.video_source_id}:t{track_id}" if track_id is not None else None
+            if job_id and candidate_key:
+                existing_cand = conn.execute(
+                    "SELECT id FROM sightings WHERE job_id=? AND candidate_key=?",
+                    (job_id, candidate_key),
+                ).fetchone()
+                if existing_cand:
+                    continue
+
             sighting_id = str(uuid.uuid4())
             subject_type = detection.get("subject_type") or detection.get("vehicle_type") or "vehicle"
             visual_attributes = detection.get("visual_attributes") or []
             frame_bytes = detection.get("frame_jpeg")
             frame_offset = float(detection.get("frame_offset_seconds", detection["start_offset_seconds"]))
-            occurred = _iso(datetime.fromisoformat(video["recorded_at"]) + timedelta(seconds=frame_offset))
+            occurred = _iso(recorded_dt + timedelta(seconds=frame_offset)) if recorded_dt is not None else None
             frame_path = None
             frame_sha256 = None
+            frame_storage_key = None
             if frame_bytes:
                 frame_dir = db.EVIDENCE_DIR / "frames"
                 frame_dir.mkdir(parents=True, exist_ok=True)
                 frame_path = frame_dir / f"{sighting_id}.jpg"
                 frame_path.write_bytes(frame_bytes)
                 frame_sha256 = hashlib.sha256(frame_bytes).hexdigest()
+                if storage_client is not None and owner_id:
+                    try:
+                        frame_storage_key = build_evidence_frame_key(
+                            str(owner_id),
+                            request.case_id,
+                            request.video_source_id,
+                            sighting_id,
+                        )
+                        storage_client.upload_evidence_frame(frame_storage_key, frame_bytes)
+                    except Exception:
+                        frame_storage_key = None
             integrity_payload = {
-                "video_sha256": video["sha256"], "case_id": request.case_id, "worker_id": request.worker_id,
-                "jurisdiction": request.jurisdiction, "camera_id": video["camera_id"], "occurred_at": occurred,
-                "video_offset_seconds": frame_offset, "vehicle_type": detection["vehicle_type"],
-                "vehicle_color": detection.get("vehicle_color"), "detector_confidence": detection["detector_confidence"],
-                "subject_type": subject_type, "visual_attributes": visual_attributes,
+                "video_sha256": video["sha256"],
+                "case_id": request.case_id,
+                "worker_id": request.worker_id,
+                "jurisdiction": request.jurisdiction,
+                "camera_id": video["camera_id"],
+                "occurred_at": occurred,
+                "video_offset_seconds": frame_offset,
+                "vehicle_type": detection["vehicle_type"],
+                "vehicle_color": detection.get("vehicle_color"),
+                "detector_confidence": detection["detector_confidence"],
+                "subject_type": subject_type,
+                "visual_attributes": visual_attributes,
                 "frame_sha256": frame_sha256,
                 "clue": clue,
             }
             evidence_hash = hashlib.sha256((video["sha256"] + db.canonical_json(integrity_payload)).encode("utf-8")).hexdigest()
             conn.execute(
-                "INSERT INTO sightings(id,case_id,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,clue_json,frame_path,frame_sha256,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (sighting_id, request.case_id, request.worker_id, request.jurisdiction, video["camera_id"], request.video_source_id,
-                 occurred, frame_offset, detection.get("track_id"), detection["vehicle_type"], detection.get("vehicle_color"),
-                 subject_type, db.canonical_json(visual_attributes), 4, db.canonical_json(clue) if clue else None,
-                 str(frame_path) if frame_path else None, frame_sha256,
-                 detection["detector_confidence"], score, evidence_hash, "pending", db.utc_now()),
+                "INSERT INTO sightings(id,case_id,job_id,candidate_key,worker_id,jurisdiction,camera_id,video_source_id,occurred_at,video_offset_seconds,track_id,vehicle_type,vehicle_color,subject_type,visual_attributes_json,integrity_version,clue_json,frame_path,frame_storage_key,frame_sha256,detector_confidence,clue_match_score,evidence_sha256,review_status,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    sighting_id,
+                    request.case_id,
+                    job_id,
+                    candidate_key,
+                    request.worker_id,
+                    request.jurisdiction,
+                    video["camera_id"],
+                    request.video_source_id,
+                    occurred,
+                    frame_offset,
+                    track_id,
+                    detection["vehicle_type"],
+                    detection.get("vehicle_color"),
+                    subject_type,
+                    db.canonical_json(visual_attributes),
+                    4,
+                    db.canonical_json(clue) if clue else None,
+                    str(frame_path) if frame_path else None,
+                    frame_storage_key,
+                    frame_sha256,
+                    detection["detector_confidence"],
+                    score,
+                    evidence_hash,
+                    "pending",
+                    db.utc_now(),
+                ),
             )
-            sighting = {"id": sighting_id, "case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
-                        "camera_id": video["camera_id"], "video_source_id": request.video_source_id, "occurred_at": occurred,
-                        "video_offset_seconds": frame_offset, "track_id": detection.get("track_id"),
-                        "vehicle_type": detection["vehicle_type"], "vehicle_color": detection.get("vehicle_color"),
-                        "subject_type": subject_type, "visual_attributes": visual_attributes,
-                        "attributes_require_human_review": True,
-                        "detector_confidence": detection["detector_confidence"], "clue_match_score": score,
-                        "frame_url": f"/api/v1/sightings/{sighting_id}/frame" if frame_path else None,
-                        "frame_sha256": frame_sha256,
-                        "evidence_sha256": evidence_hash, "review_status": "pending"}
-            sightings.append(sighting)
-            # Do not link or propagate a person candidate across cameras/zones.
-            if subject_type != "person" and score is not None and score >= FOLLOWUP_THRESHOLD:
-                follow_start = datetime.fromisoformat(detection["last_seen_at"].isoformat())
-                follow_end = follow_start + timedelta(minutes=10)
-                for zone in neighbor_zones:
-                    available = _matching_video_for_window(conn, request.case_id, zone, follow_start, follow_end)
-                    job_id = str(uuid.uuid4())
-                    conn.execute(
-                        "INSERT OR IGNORE INTO followups(id,case_id,source_sighting_id,target_zone,window_start,window_end,video_source_id,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (job_id, request.case_id, sighting_id, zone, _iso(follow_start), _iso(follow_end), available["video_source_id"] if available else None,
-                         "pending" if available else "awaiting_video", db.utc_now()),
-                    )
-        for row in conn.execute("SELECT * FROM followups WHERE case_id=? AND source_sighting_id IN (SELECT id FROM sightings WHERE video_source_id=?)", (request.case_id, request.video_source_id)).fetchall():
-            followups.append(dict(row))
-        db.audit(conn, "zone_analysis_completed", {"case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
-                                                     "video_source_id": request.video_source_id, "sighting_count": len(sightings), "followup_count": len(followups)})
+            sightings.append(
+                {
+                    "id": sighting_id,
+                    "case_id": request.case_id,
+                    "worker_id": request.worker_id,
+                    "jurisdiction": request.jurisdiction,
+                    "camera_id": video["camera_id"],
+                    "video_source_id": request.video_source_id,
+                    "occurred_at": occurred,
+                    "video_offset_seconds": frame_offset,
+                    "track_id": track_id,
+                    "vehicle_type": detection["vehicle_type"],
+                    "vehicle_color": detection.get("vehicle_color"),
+                    "subject_type": subject_type,
+                    "visual_attributes": visual_attributes,
+                    "attributes_require_human_review": True,
+                    "detector_confidence": detection["detector_confidence"],
+                    "clue_match_score": score,
+                    "frame_url": f"/api/v1/sightings/{sighting_id}/frame" if (frame_path or frame_storage_key) else None,
+                    "frame_sha256": frame_sha256,
+                    "evidence_sha256": evidence_hash,
+                    "review_status": "pending",
+                }
+            )
+        db.audit(
+            conn,
+            "zone_analysis_completed",
+            {
+                "case_id": request.case_id,
+                "worker_id": request.worker_id,
+                "jurisdiction": request.jurisdiction,
+                "video_source_id": request.video_source_id,
+                "sighting_count": len(sightings),
+            },
+        )
         if job_id:
-            finished = conn.execute("UPDATE investigation_jobs SET status='completed',updated_at=?,lease_token=NULL,lease_expires_at=NULL WHERE id=? AND status='running' AND lease_token=?",
-                                    (db.utc_now(), job_id, lease_token))
+            now = db.utc_now()
+            finished = conn.execute(
+                "UPDATE investigation_jobs "
+                "SET status='completed', finished_at=?, error_detail=NULL, updated_at=?, lease_token=NULL, lease_expires_at=NULL "
+                "WHERE id=? AND status='running' AND lease_token=?",
+                (now, now, job_id, lease_token),
+            )
             if finished.rowcount != 1:
                 raise RuntimeError("Processing lease was lost before evidence commit")
-    return {"case_id": request.case_id, "worker_id": request.worker_id, "jurisdiction": request.jurisdiction,
-            "video_source_id": request.video_source_id, "video_sha256": video["sha256"], "analysis_engine": "ultralytics-yolo-visible-target-tracking",
-            "target_scope": "people and common vehicles/objects; one-clip tracking only",
-            "facial_identification": "not performed", "cross_camera_identity_matching": "not performed",
-            "candidate_sightings": sightings, "follow_up_jobs": followups,
-            "human_review_required": True}
+    return {
+        "case_id": request.case_id,
+        "worker_id": request.worker_id,
+        "jurisdiction": request.jurisdiction,
+        "video_source_id": request.video_source_id,
+        "video_sha256": video["sha256"],
+        "analysis_engine": "ultralytics-yolo-visible-target-tracking",
+        "target_scope": "people and common vehicles/objects; one-clip tracking only",
+        "facial_identification": "not performed",
+        "cross_camera_identity_matching": "not performed",
+        "candidate_sightings": sightings,
+        "follow_up_jobs": [],
+        "human_review_required": True,
+    }
 
 
 @app.get("/api/v1/sightings")

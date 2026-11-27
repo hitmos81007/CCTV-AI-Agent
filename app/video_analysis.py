@@ -63,7 +63,7 @@ def _dominant_color(frame, xyxy: list[float], target_type: str) -> str | None:
     return "purple"
 
 
-def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0.30) -> list[dict[str, Any]]:
+def analyze_video(path: str | Path, recorded_at: datetime | None, confidence: float = 0.30) -> list[dict[str, Any]]:
     """Track visible people and common vehicles/objects within one clip only.
 
     Track IDs are ephemeral to this one video. No face, license-plate, biometric,
@@ -85,7 +85,8 @@ def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0
         model.track(source=path, stream=True, tracker="bytetrack.yaml", device=device, conf=confidence, verbose=False)
     ):
         frame = result.orig_img
-        frame_time = recorded_at + timedelta(seconds=frame_index / fps)
+        offset_sec = frame_index / fps
+        frame_time = (recorded_at + timedelta(seconds=offset_sec)) if recorded_at is not None else None
         boxes = result.boxes
         if boxes is None:
             continue
@@ -130,7 +131,8 @@ def analyze_video(path: str | Path, recorded_at: datetime, confidence: float = 0
                 x1, y1, x2, y2 = [int(value) for value in xyxys[index]]
                 evidence_frame = frame.copy()
                 cv2.rectangle(evidence_frame, (x1, y1), (x2, y2), (40, 220, 120), max(2, evidence_frame.shape[1] // 900))
-                label = f"{target_type} {confidence_value:.2f} | {frame_time.isoformat(timespec='seconds')}"
+                label_time = frame_time.isoformat(timespec="seconds") if frame_time is not None else f"+{offset_sec:.1f}s"
+                label = f"{target_type} {confidence_value:.2f} | {label_time}"
                 cv2.putText(evidence_frame, label, (max(8, x1), max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX,
                             max(0.55, evidence_frame.shape[1] / 1800), (40, 220, 120), 2, cv2.LINE_AA)
                 # Preserve the source frame with a visible detector box, not a video seek link.
