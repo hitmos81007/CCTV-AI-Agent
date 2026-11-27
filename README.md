@@ -10,17 +10,13 @@ An autonomous multi-agent CCTV investigation prototype for uploading authorized 
 
 This repository is undergoing phased consolidation toward the target MVP defined in `docs/source-of-truth/06_Implementation_Plan.md`:
 
-- **Current Phase 3 Baseline (Local Verified; Awaiting Owner Supabase Live Verification):**
-  - Official frontend consolidated to **React 19 + TypeScript + Vite** (`frontend/react/`) with dark operational command-center UI, Supabase Auth (`@supabase/supabase-js`), officer verification onboarding, and District Administrator review dashboard.
-  - Isolated **Python 3.12** environment managed with `uv` (`requirements.txt`, `requirements-video.txt`).
-  - **FastAPI** backend (`app/main.py`, `app/auth.py`, `app/verification_routes.py`) with Supabase JWKS Bearer JWT verification, authoritative database approval/suspension checks, ordered **PostgreSQL** migrations (`app/migrations.py`, `migrations/postgresql/001`–`005`), district-scoped admin review, `case_events` + `verification_events` Realtime tables, private `cctv-evidence` and `officer-verification` Supabase Storage (`app/storage.py`), and disabled legacy prototype routes (`410 Gone`).
-  - **District Admin Provisioning:** Server-side CLI `scripts/provision_admin.py` (never via public signup).
-  - **Ollama** (`llama3.2:latest`) structured clue parsing (`app/ollama_client.py`).
-  - **YOLO11n + ByteTrack** (`app/video_analysis.py`, `yolo11n.pt`) running in **CPU inference mode** (`torch` CPU wheel).
-- **Upcoming Phases (Not Yet Implemented):**
-  - **Phase 4:** Simplified case creation and batch multi-video upload UI (requires `ffmpeg`/`ffprobe`).
-  - **Phase 5:** Multi-worker concurrency (`FOR UPDATE SKIP LOCKED`) and RTX 5050 Blackwell (`sm_120`) CUDA acceleration.
-  - **Phase 6–9:** Findings integration, human review history UI polish, end-to-end testing, and production deployment.
+- **Current Phase 4 Baseline (Local Verified; Awaiting Owner Verification):**
+  - Official frontend consolidated to **React 19 + TypeScript + Vite** (`frontend/react/`) with dark operational command-center UI, Supabase Auth (`@supabase/supabase-js`), officer verification onboarding, District Administrator review dashboard, and interactive multi-video **New Investigation** workspace (`Create.tsx` / `Workspace.tsx`).
+  - Isolated **Python 3.12** environment managed with `uv` (`requirements.txt`, `requirements-video.txt`) plus **FFmpeg 9.1 / `ffprobe`** (`FFPROBE_PATH`) and **OpenCV 5.1.0**.
+  - **FastAPI** backend (`app/main.py`, `app/auth.py`, `app/verification_routes.py`, `app/ingestion.py`) with Supabase JWKS Bearer JWT verification, authoritative database approval/suspension checks, ordered **PostgreSQL** migrations (`migrations/postgresql/001`–`006`), streaming multi-video ingestion (`POST /api/v1/videos`, HTTP Range playback `GET /api/v1/videos/{id}/file`, draft deletion `DELETE /api/v1/videos/{id}`), and disabled legacy prototype routes (`410 Gone`).
+  - **Upcoming Phases (Not Yet Implemented):**
+    - **Phase 5:** Multi-worker concurrency (`FOR UPDATE SKIP LOCKED`), parallel AI orchestration, and RTX 5050 Blackwell (`sm_120`) CUDA acceleration.
+    - **Phase 6–9:** Realtime findings integration, human review history UI polish, end-to-end testing, and production deployment.
 
 ---
 
