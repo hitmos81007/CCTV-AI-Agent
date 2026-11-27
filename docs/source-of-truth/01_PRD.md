@@ -28,7 +28,7 @@ Primary persona: an authorised evidence reviewer testing a bounded collection of
 
 ## 3. Product boundaries
 
-**Required workflow:** Supabase sign-in → new investigation → description and batch upload → Start Investigation → real backend job allocation and analysis → live progress/findings → human review → persistent history.
+**Required workflow:** Officer self-registration → email verification → professional profile & supporting credential upload → District Administrator verification & approval → approved officer sign-in → new investigation → description and batch upload → Start Investigation → real backend job allocation and analysis → live progress/findings → human review → persistent history. District Administrators review applications, inspect credentials, approve/reject/request info, and suspend or reinstate officers within their assigned district without accessing officers' private investigation footage or case findings.
 
 The initial demonstration supports ordinary visible object/vehicle categories and non-identifying attributes (e.g., red car, blue bicycle, backpack) only. Outputs are candidate visual matches, not determinations of a person's identity, location trail, guilt or criminality. No face recognition, biometric identification, individual tracking across cameras, plate-based individual identification, watchlists, live feeds, automated enforcement, or autonomous decisions affecting individuals. Do not add these later by interpreting legacy functions as required. For genuine agent demonstration use staged/synthetic object or vehicle footage and a known fixture set; no fabricated findings or timings. A human can accept a finding as relevant, not establish legal evidence or guilt.
 
@@ -36,7 +36,8 @@ The initial demonstration supports ordinary visible object/vehicle categories an
 
 | ID | Must-have capability | Observable result |
 |---|---|---|
-| F01 | Supabase Auth | Invited/demo account signs in, session restores, signs out and can reset password. Unauthenticated routes redirect; no shared Basic Auth. |
+| F01 | Supabase Auth & Officer Verification | Police officers self-register, verify email, submit professional details & supporting credentials (PDF/JPEG/PNG up to 5 MB, max 3 files), and track status. Email verification alone does not grant investigation access; a District Administrator must approve the officer first, and can later suspend or reinstate access. No shared Basic Auth or public admin registration. |
+| F01b | District Administration | Server-provisioned District Administrators review district-scoped applications, inspect private verification documents, approve/reject/request info, and suspend/reinstate officers with mandatory reasons and append-only audit history, without automatic access to officers' investigation cases or footage. |
 | F02 | Overview and history | User sees only their own investigations, accurate derived counts, status and recent findings. History survives refresh and re-login. |
 | F03 | Create investigation | Enter title (optional), required description; declare footage authorised; server creates unique case ID. No required jurisdiction map or camera registry. |
 | F04 | Batch upload | Choose several videos, review names/sizes/previews, optional recording metadata; validate, show each upload state, retry failed upload, remove before start. |

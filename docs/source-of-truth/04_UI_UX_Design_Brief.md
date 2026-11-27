@@ -35,7 +35,9 @@ Desktop (>=1024px): fixed/compact ~224px sidebar; content area max-width ~1440px
 
 | Screen | Layout | Interaction |
 |---|---|---|
-| Login | Centered card, simple product name, subtitle, email/password and sign in | Password visibility optional; forgot password; generic auth error; no unnecessary marketing hero. |
+| Login & Register | Centered dark card, product name, subtitle, email/password sign-in or 3-step officer registration (Account → Professional Details → Document Upload) | Password visibility, forgot password, resend verification, field validation, safe document preview/retry; no public admin signup. |
+| Verification Status | Centered status card with timeline/details | Displays submission timestamp, status badge (`pending_review`, `additional_info_required`, `rejected`, `suspended`), administrator reason, and resubmission link when permitted. |
+| Admin Dashboard | Separate District Admin shell (Overview, Pending, Approved, Rejected, Suspended, History) + split verification workspace | Real district-backed counts, secure document preview, confirmation modal with mandatory reason for reject/request-info/suspend. |
 | Dashboard | Title, New investigation CTA, 3 small counts (cases, active cases, pending findings), active/recent case list | Counts calculated from owner data; click row opens case; empty state CTA. |
 | New case | Step labels “Describe / Add footage / Start”; form followed by drop zone and selected file list | Show per-file name, bytes, status, optional source/time; retry/remove controls; Start disabled with reason. |
 | Case workspace | Header with status, job count/progress; tabs Activity / Footage / Findings; cards or rows | Live connection status, actual worker and source status, filter/findings count, real errors; no jurisdiction map. |

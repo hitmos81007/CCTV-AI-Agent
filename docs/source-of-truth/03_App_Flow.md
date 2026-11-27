@@ -7,15 +7,20 @@ All flows below are target behavior. Keep the application small: one authenticat
 
 | Route | Access | Purpose and primary action |
 |---|---|---|
-| `/` | Either | Wait for session restore; redirect to `/dashboard` or `/login`. |
-| `/login` | Public | Email/password sign-in; forgot password; no public signup button by default. |
+| `/` | Either | Wait for session restore; redirect by role/verification status (`/dashboard`, `/admin`, `/onboarding`, `/verification-status`, or `/login`). |
+| `/login` | Public | Email/password sign-in, forgot password, and link to officer self-registration (`/register`). |
+| `/register` | Public | Police officer account signup (Step 1), email verification instructions, and resend verification. |
+| `/onboarding` | Verified unapproved officer | Multi-step professional profile (Step 2) and synthetic/redacted supporting document upload (Step 3) + submit for review. |
+| `/verification-status` | Verified non-approved officer | Display submission date, status (`draft`, `pending_review`, `additional_info_required`, `rejected`, `suspended`), review notes/reasons, and authorized resubmission. |
 | `/reset-password` | Public / valid recovery session | Request reset email or set password on recovery link; generic confirmation to avoid account enumeration. |
-| `/auth/callback` | Auth flow | Finish valid invite/recovery callback; redirect only to allowed local paths. |
-| `/dashboard` | Protected | Counts, recent and active cases; New investigation, View history. |
-| `/investigations/new` | Protected | Describe case, create draft, upload multiple files, Start Investigation. Existing `/create` redirects here. |
-| `/cases/:id` | Protected, owner | Overview, footage, actual agent activity, findings/review; draft can resume upload. |
-| `/history` | Protected | Owner's cases and filter by status/review; click case to reopen its workspace. |
-| Any other path | Either | Accessible not-found screen; return to dashboard/login. |
+| `/auth/callback` | Auth flow | Finish valid email confirmation/recovery callback; redirect only to allowed local paths. |
+| `/dashboard` | Approved officer | Counts, recent and active cases; New investigation, View history. |
+| `/investigations/new` | Approved officer | Describe case, create draft, upload multiple files, Start Investigation. Existing `/create` redirects here. |
+| `/cases/:id` | Approved officer, owner | Overview, footage, actual agent activity, findings/review; draft can resume upload. |
+| `/history` | Approved officer | Owner's cases and filter by status/review; click case to reopen its workspace. |
+| `/account` | Authenticated | Account information, district/designation summary, and Sign Out. |
+| `/admin` | Active District Administrator | District overview metrics, pending/approved/rejected/suspended officer queues, verification workspace, and administrative history. |
+| Any other path | Either | Accessible not-found screen; return to appropriate home/login. |
 
 Desktop sidebar: Overview, New investigation, History; bottom account menu with email and Sign out. No unrelated settings page, map or registry. Mobile: compact header/drawer with same navigation. Breadcrumb/back link on case/new pages. Browser back and deep-link reload work via SPA fallback. Do not make separate duplicate review/history screens; case findings and review history are in workspace. Preserve valid requested return path after login; never allow external redirect URLs.
 

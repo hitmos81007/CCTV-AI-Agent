@@ -8,14 +8,14 @@ Read the PRD and comparison PDF first. This is a target technical contract, not 
 | Layer | Use | Existing foundation / required changes |
 |---|---|---|
 | Frontend | React 19, TypeScript, Vite, existing React Router and TanStack Query, existing Tailwind/CSS | `frontend/react`; add `@supabase/supabase-js`; retain lockfile and compatible installed versions; no Next.js migration. |
-| Auth | Supabase Auth, email/password, invite-only by default | Replace `setCredentials`, in-memory `logged`, Basic dependencies; validate bearer JWT with verified provider identity on backend. |
+| Auth | Supabase Auth (email/password, self-registration + email verification) + backend administrative approval gate | Replace `setCredentials`, in-memory `logged`, Basic dependencies; validate bearer JWT via JWKS (or Auth server fallback) plus authoritative server-side `profiles` / `district_admins` status checks on every protected request. |
 | API | Python FastAPI, Pydantic, Uvicorn, httpx | `app/main.py`, `app/schemas.py`; reuse routes, introduce owner-safe response DTOs. |
 | Planner | LangGraph with existing Ollama structured clue parsing | `app/orchestration.py`, `app/ollama_client.py`; local model only sees description, validates supported object clues, no images or external data. |
 | Analysis | Existing YOLO11n weights, Ultralytics, OpenCV, ByteTrack | `app/video_analysis.py`, `requirements-video.txt`; retain within-video object processing, filter supported categories, no identity/plate matching. |
 | Worker | Existing durable PostgreSQL queue and Python worker processes | `app/worker.py`; bounded pool, claims, leases, heartbeat, fenced writes and aggregation. |
 | Persistence | Supabase PostgreSQL via psycopg; existing `app/db.py` | Extend migrations additively, no alternate production DB, keep SQLite for unit tests only. |
 | Live updates | Supabase Realtime Postgres Changes | Subscribe only to scoped case/job/sighting/review changes; invalidate queries; reconnect refetch. |
-| Media | Private Supabase Storage for durable review frames; backend durable private volume for raw footage by default | Storage object keys, hashes, authorized signed URLs, retention; raw Storage optional by owner approval. |
+| Media | Private Supabase Storage `cctv-evidence` for review frames & `officer-verification` for applicant credentials; backend durable private volume for raw footage by default | Storage object keys, hashes, backend-authorized streaming or short-lived signed URLs, retention; raw Storage optional by owner approval. |
 | Hosting | Vercel frontend; persistent local GPU or cloud backend | Not Vercel serverless for inference/worker. HTTPS host selected by owner. |
 | Testing | Existing Python tests, Playwright browser test, add auth/DB/concurrency/end-to-end tests | `tests/`, `frontend/react/tests/browser.cjs`; no replacing genuine inference with mocks in acceptance demo. |
 
