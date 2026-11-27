@@ -9,12 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class CaseCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    case_id: str | None = Field(default=None, min_length=1, max_length=80)
+    case_id: str | None = Field(default=None, min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
     title: str | None = Field(default=None, min_length=2, max_length=160)
     description: str = Field(min_length=3, max_length=4000)
     clue_notes: str | None = Field(default=None, max_length=1000)
     incident_time_text: str | None = Field(default=None, max_length=120)
-    authorized: bool = True
+    authorized: bool
     initial_zone: str = Field(default="upload-batch", min_length=1, max_length=80)
     neighbors: dict[str, list[str]] | None = None
     idempotency_key: str | None = Field(default=None, min_length=4, max_length=128)

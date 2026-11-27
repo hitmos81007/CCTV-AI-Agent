@@ -7,9 +7,11 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -70,17 +72,35 @@ if cors_origins:
     )
 DEFAULT_MAX_UPLOAD_MB = 200
 DEFAULT_MAX_CASE_VIDEOS = 10
-_CASE_UPLOAD_LOCKS_GUARD = threading.Lock()
-_CASE_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
+SAFE_CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+_ACTIVE_STAGING_GUARD = threading.Lock()
+_ACTIVE_STAGING_PATHS: set[Path] = set()
 
 
 def _case_upload_lock(case_id: str) -> threading.Lock:
-    with _CASE_UPLOAD_LOCKS_GUARD:
-        lock = _CASE_UPLOAD_LOCKS.get(case_id)
-        if lock is None:
-            lock = threading.Lock()
-            _CASE_UPLOAD_LOCKS[case_id] = lock
-        return lock
+    return db.case_lock(case_id)
+
+
+def _reconcile_incomplete_staged_uploads(max_age_seconds: int = 3600) -> int:
+    cases_root = (db.EVIDENCE_DIR.resolve(strict=False) / "cases").resolve(strict=False)
+    if not cases_root.is_dir():
+        return 0
+    cutoff = time.time() - max(0, max_age_seconds)
+    removed = 0
+    for staging in cases_root.glob("*/.staging-*"):
+        resolved = staging.resolve(strict=False)
+        if not resolved.is_relative_to(cases_root) or not resolved.is_file():
+            continue
+        with _ACTIVE_STAGING_GUARD:
+            if resolved in _ACTIVE_STAGING_PATHS:
+                continue
+        try:
+            if max_age_seconds == 0 or resolved.stat().st_mtime <= cutoff:
+                resolved.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _max_upload_bytes() -> int:
@@ -110,6 +130,7 @@ def _whisper_model():
 @app.on_event("startup")
 def startup() -> None:
     db.initialize()
+    _reconcile_incomplete_staged_uploads(max_age_seconds=0)
 
 
 def _iso(value: datetime) -> str:
@@ -381,7 +402,14 @@ def create_case(
     db.initialize()
     now = db.utc_now()
     idem = (idempotency_key or request.idempotency_key or "").strip() or None
-    case_id = (request.case_id or "").strip() or f"CASE-{uuid.uuid4().hex[:10].upper()}"
+    if request.case_id is not None:
+        if db.runtime_env() != "test":
+            raise HTTPException(status_code=422, detail="case_id is server-generated and cannot be supplied by clients")
+        if not SAFE_CASE_ID_RE.fullmatch(request.case_id):
+            raise HTTPException(status_code=422, detail="Invalid case_id format")
+        case_id = request.case_id
+    else:
+        case_id = f"CASE-{uuid.uuid4().hex[:10].upper()}"
     neighbors = request.neighbors or {request.initial_zone: []}
     clue_envelope = (
         {"clue_notes": request.clue_notes, "incident_time_text": request.incident_time_text}
@@ -455,24 +483,26 @@ def update_case_draft(
 ):
     db.initialize()
     now = db.utc_now()
-    with db.connection() as conn:
-        row = dict(owned_case_or_404(conn, case_id, user.user_id))
-        state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
-        if state and state["status"] != "draft":
-            raise HTTPException(status_code=409, detail="Only draft investigations can be edited")
-        existing_clues = json.loads(row["clues_json"]) if row.get("clues_json") else {}
-        if request.clue_notes is not None:
-            existing_clues["clue_notes"] = request.clue_notes or None
-        if request.incident_time_text is not None:
-            existing_clues["incident_time_text"] = request.incident_time_text or None
-        new_title = request.title if request.title is not None else row.get("title")
-        new_desc = request.description if request.description is not None else row["description"]
-        clues_json = db.canonical_json(existing_clues) if existing_clues else None
-        conn.execute(
-            "UPDATE cases SET title=?, description=?, clues_json=?, updated_at=? WHERE case_id=? AND owner_id=?",
-            (new_title, new_desc, clues_json, now, case_id, user.user_id),
-        )
-        db.audit(conn, "case_updated", {"case_id": case_id, "owner_id": user.user_id})
+    with db.case_lock(case_id):
+        with db.connection() as conn:
+            db.lock_case_row(conn, case_id)
+            row = dict(owned_case_or_404(conn, case_id, user.user_id))
+            state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+            if state and state["status"] != "draft":
+                raise HTTPException(status_code=409, detail="Only draft investigations can be edited")
+            existing_clues = json.loads(row["clues_json"]) if row.get("clues_json") else {}
+            if request.clue_notes is not None:
+                existing_clues["clue_notes"] = request.clue_notes or None
+            if request.incident_time_text is not None:
+                existing_clues["incident_time_text"] = request.incident_time_text or None
+            new_title = request.title if request.title is not None else row.get("title")
+            new_desc = request.description if request.description is not None else row["description"]
+            clues_json = db.canonical_json(existing_clues) if existing_clues else None
+            conn.execute(
+                "UPDATE cases SET title=?, description=?, clues_json=?, updated_at=? WHERE case_id=? AND owner_id=?",
+                (new_title, new_desc, clues_json, now, case_id, user.user_id),
+            )
+            db.audit(conn, "case_updated", {"case_id": case_id, "owner_id": user.user_id})
     return {
         "case_id": case_id,
         "title": new_title,
@@ -612,19 +642,20 @@ def list_agents(case_id: str, user: AuthenticatedUser = Depends(require_approved
 @app.post("/api/v1/cases/{case_id}/plan")
 async def plan_case(case_id: str, idempotency_key: str | None = Header(default=None, max_length=128),
                     user: AuthenticatedUser = Depends(require_approved_officer)):
-    with db.connection() as conn:
-        owned_case_or_404(conn, case_id, user.user_id)
-    try:
-        from .orchestration import plan_investigation
-        return await plan_investigation(case_id, idempotency_key)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail="LangGraph is not installed") from exc
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        raise HTTPException(status_code=503, detail="Ollama is unavailable") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    with db.case_lock(case_id):
+        with db.connection() as conn:
+            owned_case_or_404(conn, case_id, user.user_id)
+        try:
+            from .orchestration import plan_investigation
+            return await plan_investigation(case_id, idempotency_key)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail="LangGraph is not installed") from exc
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise HTTPException(status_code=503, detail="Ollama is unavailable") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/cases/{case_id}/progress")
@@ -716,6 +747,8 @@ async def upload_video(
     idempotency_key: str | None = Header(default=None, max_length=128),
 ):
     db.initialize()
+    if not SAFE_CASE_ID_RE.fullmatch(case_id):
+        raise HTTPException(status_code=422, detail="Invalid case_id format")
     safe_orig = Path(file.filename or "recording.mp4").name
     suffix = Path(safe_orig).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -734,6 +767,9 @@ async def upload_video(
 
     with db.connection() as conn:
         case = owned_case_or_404(conn, case_id, user.user_id)
+        state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+        if state and state["status"] != "draft":
+            raise HTTPException(status_code=409, detail="Videos can only be uploaded to draft investigations")
         resolved_zone = (jurisdiction or "").strip() or case["initial_zone"]
         if resolved_zone not in _case_zones(case):
             raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
@@ -741,113 +777,126 @@ async def upload_video(
     resolved_cam = (camera_id or "").strip() or f"CAM-{uuid.uuid4().hex[:8].upper()}"
     clean_label = (source_label or "").strip()[:120] or safe_orig[:120]
     video_id = str(uuid.uuid4())
-    case_dir = db.EVIDENCE_DIR / "cases" / case_id
+    evidence_root = db.EVIDENCE_DIR.resolve(strict=False)
+    cases_root = (evidence_root / "cases").resolve(strict=False)
+    case_dir = (cases_root / case_id).resolve(strict=False)
+    dest = (case_dir / f"{video_id}{suffix}").resolve(strict=False)
+    staging_dest = (case_dir / f".staging-{video_id}{suffix}").resolve(strict=False)
+    if not case_dir.is_relative_to(cases_root) or not dest.is_relative_to(case_dir) or not staging_dest.is_relative_to(case_dir):
+        raise HTTPException(status_code=422, detail="Invalid investigation storage path")
     case_dir.mkdir(parents=True, exist_ok=True)
-    dest = case_dir / f"{video_id}{suffix}"
     storage_key = f"cases/{case_id}/{video_id}{suffix}"
     digest = hashlib.sha256()
     total = 0
+    with _ACTIVE_STAGING_GUARD:
+        _ACTIVE_STAGING_PATHS.add(staging_dest)
     try:
-        with dest.open("wb") as out:
-            while chunk := await file.read(1024 * 1024):
-                total += len(chunk)
-                if total > max_bytes:
-                    raise HTTPException(status_code=413, detail=f"Video exceeds configured upload limit ({max_bytes // (1024 * 1024)} MB)")
-                digest.update(chunk)
-                out.write(chunk)
-        if total == 0:
-            raise HTTPException(status_code=422, detail="Uploaded video file is empty")
+        try:
+            with staging_dest.open("wb") as out:
+                while chunk := await file.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise HTTPException(status_code=413, detail=f"Video exceeds configured upload limit ({max_bytes // (1024 * 1024)} MB)")
+                    digest.update(chunk)
+                    out.write(chunk)
+            if total == 0:
+                raise HTTPException(status_code=422, detail="Uploaded video file is empty")
+        finally:
+            await file.close()
+
+        sha = digest.hexdigest()
+        with db.case_lock(case_id):
+            with db.connection() as conn:
+                db.lock_case_row(conn, case_id)
+                state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+                if state and state["status"] != "draft":
+                    raise HTTPException(status_code=409, detail="Videos can only be uploaded to draft investigations")
+                if idem_key:
+                    dup = conn.execute(
+                        "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
+                        "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
+                        "FROM videos WHERE case_id=? AND upload_key=?",
+                        (case_id, idem_key),
+                    ).fetchone()
+                    if dup:
+                        if dup["sha256"] != sha:
+                            raise HTTPException(status_code=409, detail="Idempotency key already used for different video content")
+                        staging_dest.unlink(missing_ok=True)
+                        return {**_serialize_video(dup), "status": "ready", "idempotent": True}
+                count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
+                if int(count_row["total"]) >= max_videos:
+                    raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
+
+        try:
+            probe = validate_and_probe_uploaded_video(staging_dest, suffix)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail="Install requirements-video.txt to accept video files") from exc
+
+        now = db.utc_now()
+        with db.case_lock(case_id):
+            with db.connection() as conn:
+                db.lock_case_row(conn, case_id)
+                state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+                if state and state["status"] != "draft":
+                    raise HTTPException(status_code=409, detail="Videos can only be uploaded to draft investigations")
+                if idem_key:
+                    dup = conn.execute(
+                        "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
+                        "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
+                        "FROM videos WHERE case_id=? AND upload_key=?",
+                        (case_id, idem_key),
+                    ).fetchone()
+                    if dup:
+                        if dup["sha256"] != sha:
+                            raise HTTPException(status_code=409, detail="Idempotency key already used for different video content")
+                        staging_dest.unlink(missing_ok=True)
+                        return {**_serialize_video(dup), "status": "ready", "idempotent": True}
+                count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
+                if int(count_row["total"]) >= max_videos:
+                    raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
+                conn.execute(
+                    "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,"
+                    "recorded_at,sha256,byte_size,duration_seconds,upload_key,source_label,storage_kind,storage_key,"
+                    "media_status,width,height,fps,codec,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        video_id, case_id, resolved_zone, resolved_cam, safe_orig, str(dest),
+                        recorded_iso, sha, total, probe["duration_seconds"], idem_key, clean_label,
+                        "local_private", storage_key, "ready", probe["width"], probe["height"], probe["fps"], probe["codec"], now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,video_source_id,recorded_at,status,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (video_id, case_id, resolved_cam, resolved_zone, "upload", video_id, recorded_iso, "ready", now),
+                )
+                conn.execute(
+                    "INSERT INTO video_metadata(video_source_id,metadata_json) VALUES(?,?) "
+                    "ON CONFLICT(video_source_id) DO UPDATE SET metadata_json=excluded.metadata_json",
+                    (video_id, db.canonical_json(probe["metadata"])),
+                )
+                db.audit(
+                    conn,
+                    "video_registered",
+                    {
+                        "video_source_id": video_id,
+                        "case_id": case_id,
+                        "jurisdiction": resolved_zone,
+                        "camera_id": resolved_cam,
+                        "sha256": sha,
+                        "byte_size": total,
+                        "duration_seconds": probe["duration_seconds"],
+                    },
+                )
+                staging_dest.replace(dest)
     except Exception:
+        staging_dest.unlink(missing_ok=True)
         dest.unlink(missing_ok=True)
         raise
     finally:
-        await file.close()
-
-    sha = digest.hexdigest()
-    with _case_upload_lock(case_id):
-        with db.connection() as conn:
-            if isinstance(conn, db.PostgresConnection):
-                conn.execute("SELECT case_id FROM public.cases WHERE case_id=? FOR UPDATE", (case_id,))
-            if idem_key:
-                dup = conn.execute(
-                    "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
-                    "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
-                    "FROM videos WHERE case_id=? AND upload_key=?",
-                    (case_id, idem_key),
-                ).fetchone()
-                if dup:
-                    dest.unlink(missing_ok=True)
-                    if dup["sha256"] != sha:
-                        raise HTTPException(status_code=409, detail="Idempotency key already used for different video content")
-                    return {**_serialize_video(dup), "status": "ready", "idempotent": True}
-            count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
-            if int(count_row["total"]) >= max_videos:
-                dest.unlink(missing_ok=True)
-                raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
-
-    try:
-        probe = validate_and_probe_uploaded_video(dest, suffix)
-    except ValueError as exc:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ImportError as exc:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(status_code=503, detail="Install requirements-video.txt to accept video files") from exc
-
-    now = db.utc_now()
-    with _case_upload_lock(case_id):
-        with db.connection() as conn:
-            if isinstance(conn, db.PostgresConnection):
-                conn.execute("SELECT case_id FROM public.cases WHERE case_id=? FOR UPDATE", (case_id,))
-            if idem_key:
-                dup = conn.execute(
-                    "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
-                    "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
-                    "FROM videos WHERE case_id=? AND upload_key=?",
-                    (case_id, idem_key),
-                ).fetchone()
-                if dup:
-                    dest.unlink(missing_ok=True)
-                    if dup["sha256"] != sha:
-                        raise HTTPException(status_code=409, detail="Idempotency key already used for different video content")
-                    return {**_serialize_video(dup), "status": "ready", "idempotent": True}
-            count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
-            if int(count_row["total"]) >= max_videos:
-                dest.unlink(missing_ok=True)
-                raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
-            conn.execute(
-                "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,"
-                "recorded_at,sha256,byte_size,duration_seconds,upload_key,source_label,storage_kind,storage_key,"
-                "media_status,width,height,fps,codec,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    video_id, case_id, resolved_zone, resolved_cam, safe_orig, str(dest),
-                    recorded_iso, sha, total, probe["duration_seconds"], idem_key, clean_label,
-                    "local_private", storage_key, "ready", probe["width"], probe["height"], probe["fps"], probe["codec"], now,
-                ),
-            )
-            conn.execute(
-                "INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,video_source_id,recorded_at,status,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (video_id, case_id, resolved_cam, resolved_zone, "upload", video_id, recorded_iso, "ready", now),
-            )
-            conn.execute(
-                "INSERT INTO video_metadata(video_source_id,metadata_json) VALUES(?,?) "
-                "ON CONFLICT(video_source_id) DO UPDATE SET metadata_json=excluded.metadata_json",
-                (video_id, db.canonical_json(probe["metadata"])),
-            )
-            db.audit(
-                conn,
-                "video_registered",
-                {
-                    "video_source_id": video_id,
-                    "case_id": case_id,
-                    "jurisdiction": resolved_zone,
-                    "camera_id": resolved_cam,
-                    "sha256": sha,
-                    "byte_size": total,
-                    "duration_seconds": probe["duration_seconds"],
-                },
-            )
+        with _ACTIVE_STAGING_GUARD:
+            _ACTIVE_STAGING_PATHS.discard(staging_dest)
     return {
         "video_source_id": video_id,
         "case_id": case_id,
@@ -894,22 +943,32 @@ def list_videos(case_id: str | None = None, jurisdiction: str | None = None, use
 def delete_draft_video(video_source_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
     with db.connection() as conn:
-        row = conn.execute(
-            "SELECT v.video_source_id,v.case_id,v.file_path,s.status AS case_status "
-            "FROM videos v JOIN cases c ON c.case_id=v.case_id "
-            "LEFT JOIN investigation_states s ON s.case_id=c.case_id "
-            "WHERE v.video_source_id=? AND c.owner_id=?",
+        pre = conn.execute(
+            "SELECT v.case_id FROM videos v JOIN cases c ON c.case_id=v.case_id WHERE v.video_source_id=? AND c.owner_id=?",
             (video_source_id, user.user_id),
         ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Video not found")
-        if row["case_status"] and row["case_status"] != "draft":
-            raise HTTPException(status_code=409, detail="Only videos in draft investigations can be removed")
-        file_path = Path(row["file_path"])
-        conn.execute("DELETE FROM recordings WHERE video_source_id=?", (video_source_id,))
-        conn.execute("DELETE FROM video_metadata WHERE video_source_id=?", (video_source_id,))
-        conn.execute("DELETE FROM videos WHERE video_source_id=?", (video_source_id,))
-        db.audit(conn, "video_removed", {"video_source_id": video_source_id, "case_id": row["case_id"]})
+    if pre is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    case_id = pre["case_id"]
+    with db.case_lock(case_id):
+        with db.connection() as conn:
+            db.lock_case_row(conn, case_id)
+            row = conn.execute(
+                "SELECT v.video_source_id,v.case_id,v.file_path,s.status AS case_status "
+                "FROM videos v JOIN cases c ON c.case_id=v.case_id "
+                "LEFT JOIN investigation_states s ON s.case_id=c.case_id "
+                "WHERE v.video_source_id=? AND c.owner_id=?",
+                (video_source_id, user.user_id),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Video not found")
+            if row["case_status"] and row["case_status"] != "draft":
+                raise HTTPException(status_code=409, detail="Only videos in draft investigations can be removed")
+            file_path = Path(row["file_path"])
+            conn.execute("DELETE FROM recordings WHERE video_source_id=?", (video_source_id,))
+            conn.execute("DELETE FROM video_metadata WHERE video_source_id=?", (video_source_id,))
+            conn.execute("DELETE FROM videos WHERE video_source_id=?", (video_source_id,))
+            db.audit(conn, "video_removed", {"video_source_id": video_source_id, "case_id": row["case_id"]})
     try:
         resolved = file_path.resolve(strict=False)
         if resolved.is_relative_to(db.EVIDENCE_DIR.resolve(strict=False)):

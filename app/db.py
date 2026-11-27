@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -429,4 +430,22 @@ def verify_audit_chain() -> bool:
             return False
         previous = row["entry_hash"]
     return True
+
+
+_CASE_LOCKS_GUARD = threading.Lock()
+_CASE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def case_lock(case_id: str) -> threading.Lock:
+    with _CASE_LOCKS_GUARD:
+        lock = _CASE_LOCKS.get(case_id)
+        if lock is None:
+            lock = threading.Lock()
+            _CASE_LOCKS[case_id] = lock
+        return lock
+
+
+def lock_case_row(conn: sqlite3.Connection, case_id: str) -> None:
+    if isinstance(conn, PostgresConnection):
+        conn.execute("SELECT case_id FROM public.cases WHERE case_id=? FOR UPDATE", (case_id,))
 

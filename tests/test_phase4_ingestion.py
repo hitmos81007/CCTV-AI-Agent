@@ -335,6 +335,98 @@ class PhaseFourIngestionAndAuthTests(unittest.TestCase):
         stored_files = list((self.root / "evidence" / "cases" / case_id).glob("*"))
         self.assertEqual(len(stored_files), 2)
 
+    def test_task50_security_corrections_enforced(self):
+        from app.main import _reconcile_incomplete_staged_uploads
+
+        # 1. Footage authorization confirmation is explicitly required (no default True)
+        no_auth = self.client.post(
+            "/api/v1/cases",
+            headers=self.h1,
+            json={"title": "Missing Auth", "description": "Red sedan."},
+        )
+        self.assertEqual(no_auth.status_code, 422)
+
+        # 2. Client-supplied case_id rejected in non-test runtime; path traversal always rejected
+        with patch.dict(os.environ, {"CCTV_ENV": "development"}):
+            client_id_resp = self.client.post(
+                "/api/v1/cases",
+                headers=self.h1,
+                json={"case_id": "CLIENT-CASE-1", "title": "T", "description": "Red sedan.", "authorized": True},
+            )
+            self.assertEqual(client_id_resp.status_code, 422)
+
+        bad_id_resp = self.client.post(
+            "/api/v1/cases",
+            headers=self.h1,
+            json={"case_id": "../escape", "title": "T", "description": "Red sedan.", "authorized": True},
+        )
+        self.assertEqual(bad_id_resp.status_code, 422)
+
+        # Create valid server-generated draft case
+        case_id = self.client.post(
+            "/api/v1/cases",
+            headers=self.h1,
+            json={"title": "Security Draft", "description": "Red sedan.", "authorized": True},
+        ).json()["case_id"]
+        self.assertTrue(case_id.startswith("CASE-"))
+        mp4 = make_synthetic_mp4(self.root, "sec.mp4")
+
+        # 3. Path traversal case_id on upload rejected before creating directory
+        trav_up = self.client.post(
+            "/api/v1/videos",
+            headers=self.h1,
+            data={"case_id": "../escape"},
+            files={"file": ("sec.mp4", mp4, "video/mp4")},
+        )
+        self.assertEqual(trav_up.status_code, 422)
+        self.assertFalse((self.root / "evidence" / "escape").exists())
+
+        # 4. DB transaction failure during upload cleans up staging and destination files
+        with patch("app.main.db.audit", side_effect=RuntimeError("simulated db failure")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    "/api/v1/videos",
+                    headers=self.h1,
+                    data={"case_id": case_id},
+                    files={"file": ("sec.mp4", mp4, "video/mp4")},
+                )
+        case_dir = self.root / "evidence" / "cases" / case_id
+        self.assertEqual(list(case_dir.glob("*")), [])
+        self.assertEqual(list(case_dir.glob(".*")), [])
+
+        # Upload one valid video while draft
+        up_ok = self.client.post(
+            "/api/v1/videos",
+            headers=self.h1,
+            data={"case_id": case_id},
+            files={"file": ("sec.mp4", mp4, "video/mp4")},
+        )
+        self.assertEqual(up_ok.status_code, 201)
+        vid_id = up_ok.json()["video_source_id"]
+
+        # 5. Staged upload reconciliation cleans orphaned .staging-* files
+        orphan = case_dir / ".staging-orphan.mp4"
+        orphan.write_bytes(b"partial")
+        self.assertGreaterEqual(_reconcile_incomplete_staged_uploads(max_age_seconds=0), 1)
+        self.assertFalse(orphan.exists())
+
+        # 6. Non-draft status blocks upload, case edit, and video deletion, and rejects late-completing uploads
+        with db.connection() as conn:
+            conn.execute("UPDATE investigation_states SET status='queued' WHERE case_id=?", (case_id,))
+        self.assertEqual(
+            self.client.patch(f"/api/v1/cases/{case_id}", headers=self.h1, json={"title": "Edited"}).status_code,
+            409,
+        )
+        self.assertEqual(self.client.delete(f"/api/v1/videos/{vid_id}", headers=self.h1).status_code, 409)
+        late_up = self.client.post(
+            "/api/v1/videos",
+            headers=self.h1,
+            data={"case_id": case_id},
+            files={"file": ("late.mp4", mp4, "video/mp4")},
+        )
+        self.assertEqual(late_up.status_code, 409)
+        self.assertEqual(len(list(case_dir.glob("*"))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

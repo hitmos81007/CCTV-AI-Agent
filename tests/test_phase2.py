@@ -37,6 +37,7 @@ class PhaseTwoContracts(unittest.TestCase):
             json={
                 "case_id": "FICTIONAL-1",
                 "description": "Fictional stolen blue vehicle",
+                "authorized": True,
                 "initial_zone": "North",
                 "neighbors": self.zones,
             },

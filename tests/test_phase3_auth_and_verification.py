@@ -329,6 +329,7 @@ class PhaseThreeAuthAndVerificationTests(unittest.TestCase):
             json={
                 "case_id": "OWNED-1",
                 "description": "Owned synthetic investigation case for Phase 3 test",
+                "authorized": True,
                 "initial_zone": "North",
                 "neighbors": {"North": ["East"], "East": ["North"]},
             },

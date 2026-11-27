@@ -155,6 +155,7 @@ class BackendContractTests(unittest.TestCase):
             json={
                 "case_id": "SYNTH-CASE-1",
                 "description": "Synthetic test case; no real incident.",
+                "authorized": True,
                 "initial_zone": "North",
                 "neighbors": FOUR_ZONE_MAP,
             },
