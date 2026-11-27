@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import type { VerificationStatus } from "../types";
+import { formatDistrictName } from "../lib/districts";
 
 const STATUS_META: Record<
   VerificationStatus | string,
@@ -441,7 +442,7 @@ export function AdminShell({
 }) {
   return (
     <BaseShell
-      brandSubtitle={`District Admin • ${districtId}`}
+      brandSubtitle={`District Admin • ${formatDistrictName(districtId)}`}
       email={email}
       onSignOut={onSignOut}
       badge={

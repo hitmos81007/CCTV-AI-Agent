@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { LogOut, RefreshCw, ShieldCheck } from "lucide-react";
 import { useAuth } from "../auth/AuthProvider";
 import { StatusChip } from "../components/Ui";
+import { formatDistrictName } from "../lib/districts";
 
 export function VerificationStatus() {
   const { me, refreshMe, signOut } = useAuth();
@@ -34,7 +35,7 @@ export function VerificationStatus() {
             </div>
             <div>
               <div className="text-xs text-[#A8B6C9]">Claimed District</div>
-              <div className="mt-0.5 font-medium">{profile?.claimed_district_id ?? "—"}</div>
+              <div className="mt-0.5 font-medium">{formatDistrictName(profile?.claimed_district_id)}</div>
             </div>
             <div>
               <div className="text-xs text-[#A8B6C9]">Designation &amp; Station</div>

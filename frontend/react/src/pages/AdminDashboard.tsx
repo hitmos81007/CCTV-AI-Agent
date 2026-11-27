@@ -18,6 +18,7 @@ import {
   PageHeader,
   StatusChip,
 } from "../components/Ui";
+import { formatDistrictName } from "../lib/districts";
 import type { AdminDecisionType } from "../types";
 
 export function AdminDashboard() {
@@ -120,7 +121,7 @@ export function AdminDashboard() {
         title="District Administration"
         subtitle={
           overview
-            ? `Authorized District: ${overview.district_id} • Administrative verification workspace`
+            ? `Authorized District: ${formatDistrictName(overview.district_id)} • Administrative verification workspace`
             : "District-scoped officer verification and access control"
         }
       />
@@ -286,7 +287,7 @@ export function AdminDashboard() {
                   <div>
                     <span className="text-[#A8B6C9]">Claimed District</span>
                     <div className="mt-0.5 font-medium text-[#F1F5F9]">
-                      {detail.profile.claimed_district_id}
+                      {formatDistrictName(detail.profile.claimed_district_id)}
                     </div>
                   </div>
                   <div>
