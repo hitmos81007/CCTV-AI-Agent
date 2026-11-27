@@ -130,7 +130,7 @@ def initialize() -> None:
                 jurisdiction TEXT NOT NULL,
                 camera_id TEXT NOT NULL,
                 video_source_id TEXT NOT NULL REFERENCES videos(video_source_id),
-                occurred_at TEXT NOT NULL,
+                occurred_at TEXT,
                 video_offset_seconds REAL NOT NULL,
                 track_id INTEGER,
                 vehicle_type TEXT NOT NULL,
@@ -241,11 +241,24 @@ def initialize() -> None:
             ("status", "TEXT NOT NULL DEFAULT 'planning'"),
             ("input_video_ids", "TEXT"),
             ("error_code", "TEXT"),
+            ("error_detail", "TEXT"),
             ("started_at", "TEXT"),
             ("finished_at", "TEXT"),
         ):
             if name not in run_columns:
                 db.execute("ALTER TABLE orchestration_runs ADD COLUMN " + name + " " + definition)
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS orchestration_runs_active_case_uidx "
+            "ON orchestration_runs(case_id) WHERE status <> 'failed'"
+        )
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS orchestration_runs_case_start_key_uidx "
+            "ON orchestration_runs(case_id, start_key) WHERE start_key IS NOT NULL"
+        )
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS sightings_job_candidate_uidx "
+            "ON sightings(job_id, candidate_key) WHERE job_id IS NOT NULL AND candidate_key IS NOT NULL"
+        )
         job_columns = {row["name"] for row in db.execute("PRAGMA table_info(investigation_jobs)").fetchall()}
         for name, definition in (
             ("attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -260,6 +273,10 @@ def initialize() -> None:
         ):
             if name not in job_columns:
                 db.execute("ALTER TABLE investigation_jobs ADD COLUMN " + name + " " + definition)
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS investigation_jobs_run_video_uidx "
+            "ON investigation_jobs(run_id, video_source_id) WHERE run_id IS NOT NULL AND video_source_id IS NOT NULL"
+        )
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS finding_reviews (

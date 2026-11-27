@@ -96,9 +96,27 @@ class VisualTargetClue(BaseModel):
     @field_validator("target_type", "color", mode="before")
     @classmethod
     def normalize_target_text(cls, value: Any) -> Any:
-        if isinstance(value, str) and value.strip().casefold() == "null":
+        if isinstance(value, str) and value.strip().casefold() in {"", "null", "none", "n/a", "unknown"}:
             return None
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("attributes", mode="before")
+    @classmethod
+    def normalize_attributes(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text or text.casefold() in {"null", "none", "n/a", "unknown", "clothing_color/type"}:
+                continue
+            if text.casefold() not in seen:
+                seen.add(text.casefold())
+                cleaned.append(text)
+        return cleaned
 
 
 class VehicleClue(BaseModel):
@@ -109,6 +127,7 @@ class VehicleClue(BaseModel):
     vehicle_type: str | None = None
     distinctive_vehicle_features: list[str] = Field(default_factory=list, max_length=12)
     visual_targets: list[VisualTargetClue] = Field(default_factory=list, max_length=20)
+    unsupported_requests: list[str] = Field(default_factory=list, max_length=20)
     event_time_text: str | None = None
     origin_zone: str | None = None
     source_text: str
@@ -117,9 +136,27 @@ class VehicleClue(BaseModel):
     @field_validator("vehicle_color", "vehicle_type", "event_time_text", "origin_zone", mode="before")
     @classmethod
     def normalize_null_strings(cls, value: Any) -> Any:
-        if isinstance(value, str) and value.strip().casefold() == "null":
+        if isinstance(value, str) and value.strip().casefold() in {"", "null", "none", "n/a", "unknown"}:
             return None
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("distinctive_vehicle_features", "unsupported_requests", mode="before")
+    @classmethod
+    def normalize_feature_lists(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text or text.casefold() in {"null", "none", "n/a", "unknown", "clothing_color/type"}:
+                continue
+            if text.casefold() not in seen:
+                seen.add(text.casefold())
+                cleaned.append(text)
+        return cleaned
 
 
 class ClueParseRequest(BaseModel):
