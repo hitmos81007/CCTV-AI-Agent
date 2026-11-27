@@ -133,6 +133,53 @@ This runs `npm --prefix react ci && npm --prefix react run build`, outputting th
 
 ---
 
+## Phase 5: Central AI Orchestrator, Durable Workers & GPU Inference
+
+### GPU vs CPU Dependency Setup
+
+- **CPU fallback:** `uv pip install --python .\.venv\Scripts\python.exe -r requirements-video.txt`
+- **NVIDIA RTX 5050 (Blackwell, CUDA 12.8):** Install PyTorch & TorchVision `cu128` wheels (do not use `cu124` on Blackwell):
+  ```powershell
+  uv pip install --python .\.venv\Scripts\python.exe --reinstall --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+  ```
+
+### Running the Phase 5 Stack Locally
+
+1. **Ollama (local clue parser):**
+   ```powershell
+   ollama serve
+   ollama pull llama3.2:latest
+   ```
+2. **PostgreSQL Migrations (Supabase):**
+   ```powershell
+   .\.venv\Scripts\python.exe -m app.migrations --dry-run
+   .\.venv\Scripts\python.exe -m app.migrations --apply
+   ```
+3. **FastAPI Backend:**
+   ```powershell
+   .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+   ```
+4. **Durable Analysis Worker(s):**
+   ```powershell
+   # Single process with bounded concurrency (1-4 threads)
+   .\.venv\Scripts\python.exe -m app.worker --concurrency 2
+   # Or run multiple independent worker processes:
+   .\.venv\Scripts\python.exe -m app.worker --worker-id agent-1
+   .\.venv\Scripts\python.exe -m app.worker --worker-id agent-2
+   ```
+5. **Frontend:**
+   ```powershell
+   npm --prefix frontend/react run dev
+   ```
+
+### Benchmark & Limitations
+
+- Benchmarked on `NVIDIA GeForce RTX 5050 Laptop GPU` (8,151 MiB VRAM, Driver `573.13`, CUDA `12.8`) with `torch==2.11.0+cu128` and `yolo11n.pt`.
+- Single-worker GPU inference on 3x3s clips took `8.638s` (`0.388s` model init, `105.53 MiB` peak VRAM). Two concurrent GPU worker processes achieved `10.23s` overlapping execution (`92.83 MiB` peak VRAM each) alongside `llama3.2:latest` (~2.5 GiB VRAM).
+- **Known limitations:** Live Supabase Realtime finding streams and human review UI remain Phase 6; local backend (`127.0.0.1:8000`) is not publicly exposed for the hosted Vercel frontend.
+
+---
+
 ## Legacy & Deprecated Components
 
 The following components are retained in the repository for reference only and are **not part of the MVP workflow**:
