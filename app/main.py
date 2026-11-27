@@ -9,6 +9,7 @@ import mimetypes
 import os
 import secrets
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -69,6 +70,17 @@ if cors_origins:
     )
 DEFAULT_MAX_UPLOAD_MB = 200
 DEFAULT_MAX_CASE_VIDEOS = 10
+_CASE_UPLOAD_LOCKS_GUARD = threading.Lock()
+_CASE_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _case_upload_lock(case_id: str) -> threading.Lock:
+    with _CASE_UPLOAD_LOCKS_GUARD:
+        lock = _CASE_UPLOAD_LOCKS.get(case_id)
+        if lock is None:
+            lock = threading.Lock()
+            _CASE_UPLOAD_LOCKS[case_id] = lock
+        return lock
 
 
 def _max_upload_bytes() -> int:
@@ -722,18 +734,6 @@ async def upload_video(
 
     with db.connection() as conn:
         case = owned_case_or_404(conn, case_id, user.user_id)
-        if idem_key:
-            existing_vid = conn.execute(
-                "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
-                "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
-                "FROM videos WHERE case_id=? AND upload_key=?",
-                (case_id, idem_key),
-            ).fetchone()
-            if existing_vid:
-                return {**_serialize_video(existing_vid), "status": "ready", "idempotent": True}
-        count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
-        if int(count_row["total"]) >= max_videos:
-            raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
         resolved_zone = (jurisdiction or "").strip() or case["initial_zone"]
         if resolved_zone not in _case_zones(case):
             raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
@@ -764,6 +764,27 @@ async def upload_video(
         await file.close()
 
     sha = digest.hexdigest()
+    with _case_upload_lock(case_id):
+        with db.connection() as conn:
+            if isinstance(conn, db.PostgresConnection):
+                conn.execute("SELECT case_id FROM public.cases WHERE case_id=? FOR UPDATE", (case_id,))
+            if idem_key:
+                dup = conn.execute(
+                    "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
+                    "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
+                    "FROM videos WHERE case_id=? AND upload_key=?",
+                    (case_id, idem_key),
+                ).fetchone()
+                if dup:
+                    dest.unlink(missing_ok=True)
+                    if dup["sha256"] != sha:
+                        raise HTTPException(status_code=409, detail="Idempotency key already used for different video content")
+                    return {**_serialize_video(dup), "status": "ready", "idempotent": True}
+            count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
+            if int(count_row["total"]) >= max_videos:
+                dest.unlink(missing_ok=True)
+                raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
+
     try:
         probe = validate_and_probe_uploaded_video(dest, suffix)
     except ValueError as exc:
@@ -774,50 +795,59 @@ async def upload_video(
         raise HTTPException(status_code=503, detail="Install requirements-video.txt to accept video files") from exc
 
     now = db.utc_now()
-    with db.connection() as conn:
-        if idem_key:
-            dup = conn.execute(
-                "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
-                "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
-                "FROM videos WHERE case_id=? AND upload_key=?",
-                (case_id, idem_key),
-            ).fetchone()
-            if dup:
+    with _case_upload_lock(case_id):
+        with db.connection() as conn:
+            if isinstance(conn, db.PostgresConnection):
+                conn.execute("SELECT case_id FROM public.cases WHERE case_id=? FOR UPDATE", (case_id,))
+            if idem_key:
+                dup = conn.execute(
+                    "SELECT video_source_id,case_id,jurisdiction,camera_id,source_label,original_name,"
+                    "recorded_at,sha256,byte_size,duration_seconds,width,height,fps,codec,media_status,created_at "
+                    "FROM videos WHERE case_id=? AND upload_key=?",
+                    (case_id, idem_key),
+                ).fetchone()
+                if dup:
+                    dest.unlink(missing_ok=True)
+                    if dup["sha256"] != sha:
+                        raise HTTPException(status_code=409, detail="Idempotency key already used for different video content")
+                    return {**_serialize_video(dup), "status": "ready", "idempotent": True}
+            count_row = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()
+            if int(count_row["total"]) >= max_videos:
                 dest.unlink(missing_ok=True)
-                return {**_serialize_video(dup), "status": "ready", "idempotent": True}
-        conn.execute(
-            "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,"
-            "recorded_at,sha256,byte_size,duration_seconds,upload_key,source_label,storage_kind,storage_key,"
-            "media_status,width,height,fps,codec,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                video_id, case_id, resolved_zone, resolved_cam, safe_orig, str(dest),
-                recorded_iso, sha, total, probe["duration_seconds"], idem_key, clean_label,
-                "local_private", storage_key, "ready", probe["width"], probe["height"], probe["fps"], probe["codec"], now,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,video_source_id,recorded_at,status,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (video_id, case_id, resolved_cam, resolved_zone, "upload", video_id, recorded_iso, "ready", now),
-        )
-        conn.execute(
-            "INSERT INTO video_metadata(video_source_id,metadata_json) VALUES(?,?) "
-            "ON CONFLICT(video_source_id) DO UPDATE SET metadata_json=excluded.metadata_json",
-            (video_id, db.canonical_json(probe["metadata"])),
-        )
-        db.audit(
-            conn,
-            "video_registered",
-            {
-                "video_source_id": video_id,
-                "case_id": case_id,
-                "jurisdiction": resolved_zone,
-                "camera_id": resolved_cam,
-                "sha256": sha,
-                "byte_size": total,
-                "duration_seconds": probe["duration_seconds"],
-            },
-        )
+                raise HTTPException(status_code=409, detail=f"Maximum of {max_videos} videos per investigation reached")
+            conn.execute(
+                "INSERT INTO videos(video_source_id,case_id,jurisdiction,camera_id,original_name,file_path,"
+                "recorded_at,sha256,byte_size,duration_seconds,upload_key,source_label,storage_kind,storage_key,"
+                "media_status,width,height,fps,codec,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    video_id, case_id, resolved_zone, resolved_cam, safe_orig, str(dest),
+                    recorded_iso, sha, total, probe["duration_seconds"], idem_key, clean_label,
+                    "local_private", storage_key, "ready", probe["width"], probe["height"], probe["fps"], probe["codec"], now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,video_source_id,recorded_at,status,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (video_id, case_id, resolved_cam, resolved_zone, "upload", video_id, recorded_iso, "ready", now),
+            )
+            conn.execute(
+                "INSERT INTO video_metadata(video_source_id,metadata_json) VALUES(?,?) "
+                "ON CONFLICT(video_source_id) DO UPDATE SET metadata_json=excluded.metadata_json",
+                (video_id, db.canonical_json(probe["metadata"])),
+            )
+            db.audit(
+                conn,
+                "video_registered",
+                {
+                    "video_source_id": video_id,
+                    "case_id": case_id,
+                    "jurisdiction": resolved_zone,
+                    "camera_id": resolved_cam,
+                    "sha256": sha,
+                    "byte_size": total,
+                    "duration_seconds": probe["duration_seconds"],
+                },
+            )
     return {
         "video_source_id": video_id,
         "case_id": case_id,

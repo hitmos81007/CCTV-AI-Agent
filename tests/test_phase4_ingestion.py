@@ -143,6 +143,15 @@ class PhaseFourIngestionAndAuthTests(unittest.TestCase):
         self.assertTrue(up_a_retry.json()["idempotent"])
         self.assertEqual(up_a_retry.json()["video_source_id"], body_a["video_source_id"])
 
+        # Reusing same Idempotency-Key with DIFFERENT video content is rejected with 409
+        up_a_conflict = self.client.post(
+            "/api/v1/videos",
+            headers={**self.h1, "Idempotency-Key": "clip-key-a"},
+            data={"case_id": case_id, "source_label": "North Gate"},
+            files={"file": ("cam_b.mp4", mp4_b, "video/mp4")},
+        )
+        self.assertEqual(up_a_conflict.status_code, 409)
+
         # Upload clip B with explicit ISO timestamp
         up_b = self.client.post(
             "/api/v1/videos",
@@ -298,6 +307,33 @@ class PhaseFourIngestionAndAuthTests(unittest.TestCase):
 
         # 8. District admin (without approved officer status) cannot access officer recordings
         self.assertEqual(self.client.get(f"/api/v1/videos/{vid_id}/file", headers=self.h_admin).status_code, 403)
+
+    def test_concurrent_uploads_cannot_exceed_max_case_videos(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        case_id = self.client.post(
+            "/api/v1/cases",
+            headers=self.h1,
+            json={"title": "Concurrent Batch Case", "description": "Red sedan.", "authorized": True},
+        ).json()["case_id"]
+        mp4 = make_synthetic_mp4(self.root, "conc.mp4")
+
+        def do_upload(idx: int) -> int:
+            resp = self.client.post(
+                "/api/v1/videos",
+                headers={**self.h1, "Idempotency-Key": f"conc-{idx}"},
+                data={"case_id": case_id},
+                files={"file": (f"conc_{idx}.mp4", mp4, "video/mp4")},
+            )
+            return resp.status_code
+
+        with patch.dict(os.environ, {"MAX_CASE_VIDEOS": "2"}):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                statuses = list(pool.map(do_upload, range(4)))
+        self.assertEqual(statuses.count(201), 2)
+        self.assertEqual(statuses.count(409), 2)
+        stored_files = list((self.root / "evidence" / "cases" / case_id).glob("*"))
+        self.assertEqual(len(stored_files), 2)
 
 
 if __name__ == "__main__":
