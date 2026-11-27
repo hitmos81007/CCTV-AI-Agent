@@ -153,6 +153,6 @@ class ResolveWorkItemsRequest(BaseModel):
 
 class ReviewDecision(BaseModel):
     decision: str = Field(pattern="^(confirmed_candidate|not_relevant|needs_more_review)$")
-    reviewer: str = Field(min_length=1, max_length=120)
+    reviewer: str | None = Field(default=None, max_length=120)
     note: str = Field(default="", max_length=2000)
 

@@ -21,17 +21,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
-from .ollama_client import OLLAMA_BASE_URL, OLLAMA_MODEL, parse_vehicle_clues
+from .auth import AuthenticatedUser, owned_case_or_404, require_approved_officer
+from .ollama_client import OLLAMA_BASE_URL, parse_vehicle_clues
 from .schemas import AnalyzeZoneRequest, AnalyzeZonesRequest, CameraCreate, InvestigationStatusUpdate, NVRReplayCreate, RecordingCreate, CaseCreate, ClueParseRequest, ResolveWorkItemsRequest, ReviewDecision
+from .verification_routes import router as verification_router
 from .video_analysis import analyze_video
 
 
-app = FastAPI(title="CCTV Investigation Agent Local API", version="0.1.0")
+app = FastAPI(title="CCTV Investigation Agent API", version="0.2.0")
 logger = logging.getLogger("cctv.api")
+app.include_router(verification_router)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -65,28 +67,6 @@ FOLLOWUP_THRESHOLD = float(os.getenv("FOLLOWUP_MATCH_THRESHOLD", "0.70"))
 VIDEO_WORKER_CONCURRENCY = max(1, min(4, int(os.getenv("VIDEO_WORKER_CONCURRENCY", "1"))))
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 ALLOWED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".flac"}
-REVIEW_USERNAME = os.getenv("REVIEW_USERNAME", "")
-REVIEW_PASSWORD = os.getenv("REVIEW_PASSWORD", "")
-review_auth = HTTPBasic(auto_error=False)
-
-
-def require_reviewer(credentials: HTTPBasicCredentials | None = Depends(review_auth)) -> str:
-    if not REVIEW_USERNAME or not REVIEW_PASSWORD:
-        raise HTTPException(status_code=503, detail="Reviewer access is not configured")
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Reviewer authentication required", headers={"WWW-Authenticate": "Basic"})
-    username_ok = secrets.compare_digest(credentials.username, REVIEW_USERNAME)
-    password_ok = secrets.compare_digest(credentials.password, REVIEW_PASSWORD)
-    if not (username_ok and password_ok):
-        raise HTTPException(status_code=401, detail="Invalid reviewer credentials", headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
-
-
-def require_api_access(credentials: HTTPBasicCredentials | None = Depends(review_auth)) -> str:
-    """Require reviewer auth when the API is configured for a hosted frontend."""
-    if not cors_origins:
-        return "local"
-    return require_reviewer(credentials)
 
 
 @lru_cache(maxsize=1)
@@ -318,135 +298,103 @@ def _video_runtime_status() -> dict[str, Any]:
     return result
 
 
+def _legacy_disabled() -> None:
+    raise HTTPException(status_code=410, detail="Legacy endpoint is disabled in the authenticated MVP")
+
+
 @app.get("/", include_in_schema=False)
-def review_home(_: str = Depends(require_reviewer)):
-    return FileResponse(Path(__file__).parent / "static" / "review.html")
+def review_home():
+    _legacy_disabled()
 
 
 @app.get("/api-config.js", include_in_schema=False)
-def api_config(_: str = Depends(require_reviewer)):
-    return FileResponse(Path(__file__).parent / "static" / "api-config.js", media_type="application/javascript")
+def api_config():
+    _legacy_disabled()
 
 
 @app.get("/health")
-async def health(_: str = Depends(require_api_access)):
-    db.initialize()
-    try:
-        async with httpx.AsyncClient(timeout=2) as client:
-            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
-            ollama_ready = response.is_success
-            ollama_models = [m.get("name") for m in response.json().get("models", [])] if response.is_success else []
-    except Exception:
-        ollama_ready, ollama_models = False, []
-    return {
-        "status": "ok",
-        "ollama_ready": ollama_ready,
-        "ollama_model": OLLAMA_MODEL,
-        "ollama_available_models": ollama_models,
-        "yolo_model": os.getenv("YOLO_MODEL", "yolo11n.pt"),
-        "yolo_device": os.getenv("YOLO_DEVICE", "auto"),
-        "video_runtime": _video_runtime_status(),
-        "face_identification": "not implemented",
-        "evidence_directory": str(db.EVIDENCE_DIR),
-    }
+async def health():
+    return {"status": "ok"}
 
 
 @app.post("/api/v1/investigations/start", status_code=201)
-async def start_investigation(request: CaseCreate, _: str = Depends(require_api_access)):
-    """Create/reuse a matching case and extract visible-target clues with local Ollama."""
-    db.initialize()
-    with db.connection() as conn:
-        existing = conn.execute("SELECT * FROM cases WHERE case_id=?", (request.case_id,)).fetchone()
-        if existing:
-            expected_neighbors = db.canonical_json(request.neighbors)
-            if (existing["description"] != request.description
-                    or existing["initial_zone"] != request.initial_zone
-                    or existing["neighbors_json"] != expected_neighbors):
-                raise HTTPException(status_code=409, detail="case_id exists with different case data")
-        else:
-            conn.execute(
-                "INSERT INTO cases(case_id,description,initial_zone,neighbors_json,created_at) VALUES(?,?,?,?,?)",
-                (request.case_id, request.description, request.initial_zone, db.canonical_json(request.neighbors), db.utc_now()),
-            )
-            db.audit(conn, "case_created", request.model_dump())
-    try:
-        clue = await parse_vehicle_clues(request.case_id, request.description, request.initial_zone)
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        raise HTTPException(status_code=503, detail=f"Local Ollama is not available at {OLLAMA_BASE_URL}") from exc
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama returned HTTP {exc.response.status_code}") from exc
-    except (ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=502, detail="Ollama response did not match the clue schema") from exc
-    with db.connection() as conn:
-        conn.execute("UPDATE cases SET clues_json=? WHERE case_id=?", (clue.model_dump_json(), request.case_id))
-        db.audit(conn, "vehicle_clues_parsed", {"case_id": request.case_id, "parser": clue.parser, "clue": clue.model_dump()})
-        registered_videos = [dict(row) for row in conn.execute(
-            "SELECT video_source_id,case_id,jurisdiction,camera_id,recorded_at,sha256,byte_size,duration_seconds "
-            "FROM videos WHERE case_id=? ORDER BY jurisdiction,recorded_at,video_source_id",
-            (request.case_id,),
-        ).fetchall()]
-    return {
-        "case_id": request.case_id,
-        "description": request.description,
-        "initial_zone": request.initial_zone,
-        "neighbors": request.neighbors,
-        "clue": clue.model_dump(),
-        "registered_videos": registered_videos,
-        "status": "ready_for_zone_review",
-    }
+async def start_investigation(request: CaseCreate, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/cases", status_code=201)
-def create_case(request: CaseCreate, _: str = Depends(require_api_access)):
+def create_case(request: CaseCreate, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
+    now = db.utc_now()
     with db.connection() as conn:
         existing = conn.execute("SELECT case_id FROM cases WHERE case_id=?", (request.case_id,)).fetchone()
         if existing:
             raise HTTPException(status_code=409, detail="case_id already exists")
         conn.execute(
-            "INSERT INTO cases(case_id,description,initial_zone,neighbors_json,created_at) VALUES(?,?,?,?,?)",
-            (request.case_id, request.description, request.initial_zone, db.canonical_json(request.neighbors), db.utc_now()),
+            "INSERT INTO cases(case_id,owner_id,description,initial_zone,neighbors_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (request.case_id, user.user_id, request.description, request.initial_zone, db.canonical_json(request.neighbors), now, now),
         )
-        db.audit(conn, "case_created", request.model_dump())
-    return {"case_id": request.case_id, "status": "created", "neighbors": request.neighbors}
+        db.audit(conn, "case_created", {"case_id": request.case_id, "owner_id": user.user_id})
+    return {"case_id": request.case_id, "status": "draft", "neighbors": request.neighbors, "created_at": now}
 
 
 @app.get("/api/v1/cases")
-def list_cases(_: str = Depends(require_api_access)):
+def list_cases(user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
     with db.connection() as conn:
-        rows = conn.execute("SELECT * FROM cases ORDER BY created_at DESC").fetchall()
-    return [{**dict(row), "neighbors": json.loads(row["neighbors_json"]), "clues": json.loads(row["clues_json"]) if row["clues_json"] else None} for row in rows]
+        rows = conn.execute(
+            "SELECT case_id,title,description,clues_json,authorized_at,created_at,updated_at "
+            "FROM cases WHERE owner_id=? ORDER BY created_at DESC",
+            (user.user_id,),
+        ).fetchall()
+        items = []
+        for row in rows:
+            case_id = row["case_id"]
+            state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+            video_count = conn.execute("SELECT COUNT(*) AS total FROM videos WHERE case_id=?", (case_id,)).fetchone()["total"]
+            finding_count = conn.execute("SELECT COUNT(*) AS total FROM sightings WHERE case_id=?", (case_id,)).fetchone()["total"]
+            pending_count = conn.execute("SELECT COUNT(*) AS total FROM sightings WHERE case_id=? AND review_status='pending'", (case_id,)).fetchone()["total"]
+            items.append({
+                "case_id": case_id,
+                "title": row["title"],
+                "description": row["description"],
+                "status": state["status"] if state else "draft",
+                "clues": json.loads(row["clues_json"]) if row["clues_json"] else None,
+                "video_count": int(video_count),
+                "finding_count": int(finding_count),
+                "pending_finding_count": int(pending_count),
+                "authorized_at": row["authorized_at"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            })
+    return items
 
 
 @app.get("/api/v1/cases/{case_id}")
-def get_case(case_id: str, _: str = Depends(require_api_access)):
+def get_case(case_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
     with db.connection() as conn:
-        row = dict(_case_or_404(conn, case_id))
-    row["neighbors"] = json.loads(row["neighbors_json"])
-    row["clues"] = json.loads(row["clues_json"]) if row["clues_json"] else None
-    return row
+        row = dict(owned_case_or_404(conn, case_id, user.user_id))
+        state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
+    return {
+        "case_id": row["case_id"],
+        "title": row.get("title"),
+        "description": row["description"],
+        "status": state["status"] if state else "draft",
+        "clues": json.loads(row["clues_json"]) if row.get("clues_json") else None,
+        "authorized_at": row.get("authorized_at"),
+        "created_at": row["created_at"],
+        "updated_at": row.get("updated_at"),
+    }
 
 
 @app.get("/api/v1/cases/{case_id}/jurisdictions")
-def get_jurisdictions(case_id: str, _: str = Depends(require_api_access)):
-    with db.connection() as conn:
-        row = _case_or_404(conn, case_id)
-        return {"case_id": case_id, "initial_zone": row["initial_zone"], "neighbors": json.loads(row["neighbors_json"])}
+def get_jurisdictions(case_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/cameras", status_code=201)
-def register_camera(camera: CameraCreate, _: str = Depends(require_api_access)):
-    if camera.source_uri:
-        _validate_source_uri(camera.source_uri)
-    with db.connection() as conn:
-        if conn.execute("SELECT camera_id FROM cameras WHERE camera_id=?", (camera.camera_id,)).fetchone():
-            raise HTTPException(status_code=409, detail="camera_id already exists")
-        conn.execute("INSERT INTO cameras(camera_id,jurisdiction,name,latitude,longitude,source_type,source_uri,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (camera.camera_id, camera.jurisdiction, camera.name, camera.latitude, camera.longitude,
-                      camera.source_type, camera.source_uri, db.utc_now()))
-        db.audit(conn, "camera_registered", camera.model_dump())
-    return camera.model_dump()
+def register_camera(camera: CameraCreate, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 def _validate_source_uri(uri: str) -> None:
@@ -458,142 +406,56 @@ def _validate_source_uri(uri: str) -> None:
 
 
 @app.get("/api/v1/cameras")
-def list_cameras(_: str = Depends(require_api_access)):
-    with db.connection() as conn:
-        return [dict(row) for row in conn.execute("SELECT * FROM cameras ORDER BY camera_id").fetchall()]
+def list_cameras(user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/cameras/{camera_id}/nvr-recordings")
-def discover_nvr_recordings(camera_id: str, _: str = Depends(require_reviewer)):
-    with db.connection() as conn:
-        row = conn.execute("SELECT * FROM cameras WHERE camera_id=?", (camera_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    try:
-        from .onvif_nvr import OnvifNVR
-        return {"camera_id": camera_id, "recordings": jsonable_encoder(OnvifNVR(dict(row)).recordings())}
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail="Install requirements-onvif.txt for NVR discovery") from exc
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.warning("NVR discovery failed for camera %s: %s", camera_id, type(exc).__name__)
-        raise HTTPException(status_code=502, detail="NVR discovery failed; check device compatibility and connectivity") from exc
+def discover_nvr_recordings(camera_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/cameras/{camera_id}/nvr-replay", status_code=201)
-def register_nvr_replay(camera_id: str, request: NVRReplayCreate, _: str = Depends(require_reviewer)):
-    with db.connection() as conn:
-        camera = conn.execute("SELECT * FROM cameras WHERE camera_id=?", (camera_id,)).fetchone()
-    if not camera:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    try:
-        from .onvif_nvr import OnvifNVR
-        uri = OnvifNVR(dict(camera)).replay_uri(request.recording_token)
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail="Install requirements-onvif.txt for NVR replay") from exc
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.warning("NVR replay request failed for camera %s: %s", camera_id, type(exc).__name__)
-        raise HTTPException(status_code=502, detail="NVR replay request failed") from exc
-    result = register_recording(RecordingCreate(case_id=request.case_id, camera_id=camera_id,
-                                source_type="ip_camera", source_uri=uri, recorded_at=request.recorded_at), _)
-    return {**result, "source": "onvif_nvr_replay"}
+def register_nvr_replay(camera_id: str, request: NVRReplayCreate, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/recordings", status_code=201)
-def register_recording(recording: RecordingCreate, _: str = Depends(require_api_access)):
-    from urllib.parse import urlsplit
-    parsed = urlsplit(recording.source_uri)
-    _validate_source_uri(recording.source_uri)
-    if recording.source_type == "ip_camera" and parsed.scheme not in ("rtsp", "rtsps"):
-        raise HTTPException(status_code=422, detail="IP camera source must be an RTSP or RTSPS URI")
-    with db.connection() as conn:
-        case = _case_or_404(conn, recording.case_id)
-        camera = conn.execute("SELECT * FROM cameras WHERE camera_id=?", (recording.camera_id,)).fetchone()
-        if not camera:
-            raise HTTPException(status_code=404, detail="Camera not found")
-        if camera["jurisdiction"] not in _case_zones(case):
-            raise HTTPException(status_code=422, detail="Camera jurisdiction is not part of this case")
-        rid = str(uuid.uuid4())
-        conn.execute("INSERT INTO recordings(id,case_id,camera_id,jurisdiction,source_type,source_uri,recorded_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                     (rid, recording.case_id, recording.camera_id, camera["jurisdiction"], recording.source_type,
-                      recording.source_uri, _iso(recording.recorded_at) if recording.recorded_at else None, "registered", db.utc_now()))
-        db.audit(conn, "recording_registered", {"id": rid, "case_id": recording.case_id, "source_type": recording.source_type})
-    return {"id": rid, "status": "registered", "ingestion_status": "not_ingested"}
+def register_recording(recording: RecordingCreate, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/recordings")
 def list_recordings(case_id: str, jurisdiction: str | None = None, camera_id: str | None = None,
-                    source_type: str | None = None, _: str = Depends(require_api_access)):
-    db.initialize()
-    with db.connection() as conn:
-        _case_or_404(conn, case_id)
-        items = [dict(row) for row in conn.execute("SELECT * FROM recordings WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()]
-        items = [row for row in items if (not jurisdiction or row["jurisdiction"] == jurisdiction)
-                 and (not camera_id or row["camera_id"] == camera_id)
-                 and (not source_type or row["source_type"] == source_type)]
-        external = [row for row in items if row["source_type"] != "upload"]
-        uploads = [dict(row) for row in conn.execute("SELECT video_source_id,case_id,camera_id,jurisdiction,recorded_at,sha256,byte_size,duration_seconds,created_at FROM videos WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()]
-    return {"items": items, "sources": external, "uploaded_videos": uploads}
+                    source_type: str | None = None, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/recordings/{recording_id}")
-def get_recording(recording_id: str, _: str = Depends(require_api_access)):
-    db.initialize()
-    with db.connection() as conn:
-        record = conn.execute("SELECT * FROM recordings WHERE id=?", (recording_id,)).fetchone()
-        metadata = conn.execute("SELECT metadata_json FROM video_metadata WHERE video_source_id=?",
-                                (record["video_source_id"],)).fetchone() if record and record["video_source_id"] else None
-    if not record:
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return {**dict(record), "metadata": json.loads(metadata["metadata_json"]) if metadata else None}
+def get_recording(recording_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/recordings/{recording_id}/analyze")
-def analyze_recording(recording_id: str, _: str = Depends(require_api_access)):
-    record = get_recording(recording_id, _)
-    if not record["video_source_id"] or record["status"] != "ready":
-        raise HTTPException(status_code=409, detail="Source must be ingested before analysis")
-    return analyze_zone(AnalyzeZoneRequest(
-        case_id=record["case_id"], jurisdiction=record["jurisdiction"],
-        worker_id="zone_worker_" + record["jurisdiction"].lower().replace(" ", "_"),
-        video_source_id=record["video_source_id"],
-    ), _)
+def analyze_recording(recording_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/recordings/{recording_id}/ingest")
-def ingest_recording(recording_id: str, seconds: int = 10, _: str = Depends(require_reviewer)):
-    if not 1 <= seconds <= 60:
-        raise HTTPException(status_code=422, detail="Capture duration must be between 1 and 60 seconds")
-    record = get_recording(recording_id, _)
-    try:
-        from .ingestion import ingest
-        video_id = ingest(record, seconds)
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except (ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"recording_id": recording_id, "video_source_id": video_id, "status": "ready"}
+def ingest_recording(recording_id: str, seconds: int = 10, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/agents")
-def list_agents(case_id: str, _: str = Depends(require_api_access)):
-    with db.connection() as conn:
-        case = _case_or_404(conn, case_id)
-        zones = json.loads(case["neighbors_json"])
-    return [{"worker_id": "zone_worker_" + zone.lower().replace(" ", "_"), "jurisdiction": zone,
-             "neighbors": neighbors} for zone, neighbors in zones.items()]
+def list_agents(case_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/cases/{case_id}/plan")
 async def plan_case(case_id: str, idempotency_key: str | None = Header(default=None, max_length=128),
-                    _: str = Depends(require_api_access)):
+                    user: AuthenticatedUser = Depends(require_approved_officer)):
+    with db.connection() as conn:
+        owned_case_or_404(conn, case_id, user.user_id)
     try:
         from .orchestration import plan_investigation
         return await plan_investigation(case_id, idempotency_key)
@@ -608,44 +470,55 @@ async def plan_case(case_id: str, idempotency_key: str | None = Header(default=N
 
 
 @app.get("/api/v1/cases/{case_id}/progress")
-def case_progress(case_id: str, _: str = Depends(require_api_access)):
+def case_progress(case_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
     with db.connection() as conn:
-        _case_or_404(conn, case_id)
-        jobs = [dict(row) for row in conn.execute("SELECT * FROM investigation_jobs WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()]
+        owned_case_or_404(conn, case_id, user.user_id)
+        jobs = [
+            {
+                "id": row["id"],
+                "video_source_id": row["video_source_id"],
+                "worker_id": row["worker_id"],
+                "status": row["status"],
+                "attempts": int(row["attempts"] or 0),
+                "updated_at": row["updated_at"],
+            }
+            for row in conn.execute(
+                "SELECT id,video_source_id,worker_id,status,attempts,updated_at FROM investigation_jobs WHERE case_id=? ORDER BY created_at",
+                (case_id,),
+            ).fetchall()
+        ]
         count = conn.execute("SELECT COUNT(*) AS total FROM sightings WHERE case_id=?", (case_id,)).fetchone()["total"]
         state = conn.execute("SELECT status,updated_at FROM investigation_states WHERE case_id=?", (case_id,)).fetchone()
-    return {"case_id": case_id, "status": state["status"] if state else "open",
-            "status_updated_at": state["updated_at"] if state else None, "jobs": jobs, "sighting_count": count}
+    return {
+        "case_id": case_id,
+        "status": state["status"] if state else "draft",
+        "status_updated_at": state["updated_at"] if state else None,
+        "jobs": jobs,
+        "sighting_count": count,
+    }
 
 
 @app.put("/api/v1/cases/{case_id}/status")
-def update_case_status(case_id: str, request: InvestigationStatusUpdate, _: str = Depends(require_api_access)):
-    with db.connection() as conn:
-        _case_or_404(conn, case_id)
-        now = db.utc_now()
-        conn.execute("INSERT INTO investigation_states(case_id,status,updated_at) VALUES(?,?,?) ON CONFLICT(case_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at",
-                     (case_id, request.status, now))
-        db.audit(conn, "investigation_status_changed", {"case_id": case_id, "status": request.status})
-    return {"case_id": case_id, "status": request.status, "updated_at": now}
+def update_case_status(case_id: str, request: InvestigationStatusUpdate, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/evidence")
-def list_evidence(case_id: str, _: str = Depends(require_reviewer)):
+def list_evidence(case_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
     with db.connection() as conn:
-        _case_or_404(conn, case_id)
+        owned_case_or_404(conn, case_id, user.user_id)
         rows = conn.execute("SELECT id,video_source_id,occurred_at,video_offset_seconds,evidence_sha256,frame_sha256,review_status FROM sightings WHERE case_id=? ORDER BY occurred_at", (case_id,)).fetchall()
     return [dict(row) for row in rows]
 
 
 @app.post("/api/v1/clues/parse")
-async def parse_clues(request: ClueParseRequest, _: str = Depends(require_api_access)):
+async def parse_clues(request: ClueParseRequest, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
     with db.connection() as conn:
-        case = _case_or_404(conn, request.case_id)
+        case = owned_case_or_404(conn, request.case_id, user.user_id)
         saved_initial_zone = case["initial_zone"]
         previous_clue_json = case["clues_json"]
     try:
-        # A case keeps its saved direction map; clue updates can reuse its footage.
         clue = await parse_vehicle_clues(request.case_id, request.description, saved_initial_zone)
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise HTTPException(status_code=503, detail=f"Local Ollama is not available at {OLLAMA_BASE_URL}") from exc
@@ -655,56 +528,26 @@ async def parse_clues(request: ClueParseRequest, _: str = Depends(require_api_ac
         raise HTTPException(status_code=502, detail="Ollama response did not match the clue schema") from exc
     with db.connection() as conn:
         if previous_clue_json:
-            # Freeze the old query context onto legacy sightings before replacing the
-            # case's active clue; preserve their video and review decisions unchanged.
             conn.execute("UPDATE sightings SET clue_json=? WHERE case_id=? AND clue_json IS NULL",
                          (previous_clue_json, request.case_id))
-        conn.execute("UPDATE cases SET description=?,clues_json=? WHERE case_id=?",
-                     (request.description, clue.model_dump_json(), request.case_id))
-        db.audit(conn, "case_clue_updated", {"case_id": request.case_id, "description": request.description,
+        conn.execute("UPDATE cases SET description=?,clues_json=?,updated_at=? WHERE case_id=? AND owner_id=?",
+                     (request.description, clue.model_dump_json(), db.utc_now(), request.case_id, user.user_id))
+        db.audit(conn, "case_clue_updated", {"case_id": request.case_id, "owner_id": user.user_id,
                                                "parser": clue.parser, "clue": clue.model_dump()})
     return clue.model_dump()
 
 
 @app.post("/api/v1/clues/transcribe")
 async def transcribe_clue_audio(
-    _: str = Depends(require_reviewer),
+    user: AuthenticatedUser = Depends(require_approved_officer),
     file: UploadFile = File(...),
 ):
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in ALLOWED_AUDIO_EXTENSIONS:
-        raise HTTPException(status_code=415, detail=f"Supported audio extensions: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}")
-    audio_bytes = await file.read(100 * 1024 * 1024 + 1)
-    if len(audio_bytes) > 100 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Audio recording exceeds the 100 MB limit")
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix="cctv-clue-", suffix=suffix, delete=False) as temp_audio:
-            temp_audio.write(audio_bytes)
-            temp_path = Path(temp_audio.name)
-        segments, info = _whisper_model().transcribe(
-            str(temp_path), beam_size=1, condition_on_previous_text=False,
-        )
-        transcript = " ".join(segment.text.strip() for segment in segments).strip()
-        if not transcript:
-            raise HTTPException(status_code=422, detail="No speech was recognized in the recording")
-        return {"transcript": transcript, "language": info.language, "language_probability": info.language_probability,
-                "transcription_model": os.getenv("WHISPER_MODEL", "base"), "stored": False}
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail="Local audio transcription is not installed; install requirements-audio.txt") from exc
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Local audio transcription failed: {type(exc).__name__}: {exc}") from exc
-    finally:
-        await file.close()
-        if temp_path and temp_path.exists():
-            temp_path.unlink()
+    _legacy_disabled()
 
 
 @app.post("/api/v1/videos", status_code=201)
 async def upload_video(
-    _: str = Depends(require_reviewer),
+    user: AuthenticatedUser = Depends(require_approved_officer),
     case_id: str = Form(...),
     jurisdiction: str = Form(...),
     camera_id: str = Form(...),
@@ -720,7 +563,7 @@ async def upload_video(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="recorded_at must be an ISO-8601 timestamp") from exc
     with db.connection() as conn:
-        case = _case_or_404(conn, case_id)
+        case = owned_case_or_404(conn, case_id, user.user_id)
         if jurisdiction not in _case_zones(case):
             raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
     video_id = str(uuid.uuid4())
@@ -770,94 +613,40 @@ async def upload_video(
 
 
 @app.get("/api/v1/videos")
-def list_videos(case_id: str | None = None, jurisdiction: str | None = None, _: str = Depends(require_reviewer)):
+def list_videos(case_id: str | None = None, jurisdiction: str | None = None, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
-    query = "SELECT video_source_id,case_id,jurisdiction,camera_id,original_name,recorded_at,sha256,byte_size,duration_seconds,created_at FROM videos WHERE 1=1"
-    params: list[str] = []
+    query = (
+        "SELECT v.video_source_id,v.case_id,v.jurisdiction,v.camera_id,v.original_name,"
+        "v.recorded_at,v.sha256,v.byte_size,v.duration_seconds,v.created_at "
+        "FROM videos v JOIN cases c ON c.case_id=v.case_id WHERE c.owner_id=?"
+    )
+    params: list[str] = [user.user_id]
     if case_id:
-        query += " AND case_id=?"
+        query += " AND v.case_id=?"
         params.append(case_id)
     if jurisdiction:
-        query += " AND jurisdiction=?"
+        query += " AND v.jurisdiction=?"
         params.append(jurisdiction)
-    query += " ORDER BY recorded_at"
+    query += " ORDER BY v.recorded_at"
     with db.connection() as conn:
         rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
 
 @app.post("/api/v1/work-items/resolve")
-def resolve_work_items(request: ResolveWorkItemsRequest, _: str = Depends(require_api_access)):
-    """Attach every locally registered clip for each allowed jurisdiction work item.
-
-    Items without a clip are kept in the response with a null source ID so the
-    n8n guard can visibly hold them. No detection or sighting is synthesized.
-    """
-    db.initialize()
-    resolved: list[dict[str, Any]] = []
-    with db.connection() as conn:
-        case = _case_or_404(conn, request.case_id)
-        allowed_zones = _case_zones(case)
-
-        for item in request.items:
-            if item.get("case_id") not in (None, request.case_id):
-                raise HTTPException(status_code=409, detail="Work item case_id does not match the request")
-            zone = str(item.get("jurisdiction") or "").strip()
-            if not zone or zone not in allowed_zones:
-                raise HTTPException(status_code=422, detail=f"Jurisdiction is not part of this case's zone map: {zone or '(empty)'}")
-
-            requested_video_id = item.get("video_source_id")
-            if requested_video_id:
-                video_rows = conn.execute(
-                    "SELECT video_source_id,case_id,jurisdiction,camera_id,recorded_at,sha256,duration_seconds "
-                    "FROM videos WHERE video_source_id=?",
-                    (str(requested_video_id),),
-                ).fetchall()
-                if not video_rows:
-                    raise HTTPException(status_code=409, detail="Work item video_source_id is not registered locally")
-                if video_rows[0]["case_id"] != request.case_id or video_rows[0]["jurisdiction"] != zone:
-                    raise HTTPException(status_code=409, detail="Video case or jurisdiction does not match this work item")
-            else:
-                video_rows = conn.execute(
-                    "SELECT video_source_id,case_id,jurisdiction,camera_id,recorded_at,sha256,duration_seconds "
-                    "FROM videos WHERE case_id=? AND jurisdiction=? ORDER BY recorded_at,created_at,video_source_id",
-                    (request.case_id, zone),
-                ).fetchall()
-
-            if not video_rows:
-                resolved.append({
-                    **item,
-                    "case_id": request.case_id,
-                    "video_source_id": None,
-                    "status": "awaiting_local_video",
-                })
-                continue
-
-            for video in video_rows:
-                resolved.append({
-                    **item,
-                    "case_id": request.case_id,
-                    "video_source_id": video["video_source_id"],
-                    "camera_id": video["camera_id"],
-                    "video_recorded_at": video["recorded_at"],
-                    "video_sha256": video["sha256"],
-                    "video_duration_seconds": video["duration_seconds"],
-                    "status": "ready_for_analysis",
-                })
-
-    return {
-        "case_id": request.case_id,
-        "count": len(resolved),
-        "ready_count": sum(1 for item in resolved if item["video_source_id"]),
-        "items": resolved,
-    }
+def resolve_work_items(request: ResolveWorkItemsRequest, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/videos/{video_source_id}/file")
-def get_video_file(video_source_id: str, _: str = Depends(require_reviewer)):
+def get_video_file(video_source_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
     with db.connection() as conn:
-        row = conn.execute("SELECT file_path,original_name FROM videos WHERE video_source_id=?", (video_source_id,)).fetchone()
+        row = conn.execute(
+            "SELECT v.file_path,v.original_name FROM videos v JOIN cases c ON c.case_id=v.case_id "
+            "WHERE v.video_source_id=? AND c.owner_id=?",
+            (video_source_id, user.user_id),
+        ).fetchone()
     if row is None or not Path(row["file_path"]).is_file():
         raise HTTPException(status_code=404, detail="Video not found")
     return FileResponse(
@@ -868,10 +657,14 @@ def get_video_file(video_source_id: str, _: str = Depends(require_reviewer)):
 
 
 @app.get("/api/v1/sightings/{sighting_id}/frame")
-def get_sighting_frame(sighting_id: str, _: str = Depends(require_reviewer)):
+def get_sighting_frame(sighting_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
     with db.connection() as conn:
-        row = conn.execute("SELECT frame_path FROM sightings WHERE id=?", (sighting_id,)).fetchone()
+        row = conn.execute(
+            "SELECT s.frame_path FROM sightings s JOIN cases c ON c.case_id=s.case_id "
+            "WHERE s.id=? AND c.owner_id=?",
+            (sighting_id, user.user_id),
+        ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not row["frame_path"] or not Path(row["frame_path"]).is_file():
@@ -880,80 +673,13 @@ def get_sighting_frame(sighting_id: str, _: str = Depends(require_reviewer)):
 
 
 @app.post("/api/v1/zones/analyze")
-async def analyze_zones(request: AnalyzeZonesRequest, _: str = Depends(require_api_access)):
-    """Dispatch the four directional work items together, with a local inference limit."""
-    with db.connection() as conn:
-        case = _case_or_404(conn, request.case_id)
-        allowed_zones = _case_zones(case)
-    slots = asyncio.Semaphore(VIDEO_WORKER_CONCURRENCY)
-
-    async def run_item(item: dict[str, Any]) -> dict[str, Any]:
-        if item.get("case_id") not in (None, request.case_id):
-            return {"status": "failed", "http_status": 409, "detail": "Work item case_id does not match the request"}
-        zone = str(item.get("jurisdiction") or "").strip()
-        if zone not in allowed_zones:
-            return {"status": "failed", "http_status": 422, "detail": f"Jurisdiction is not part of this case's zone map: {zone or '(empty)'}"}
-        if not item.get("video_source_id"):
-            return {
-                "status": "awaiting_local_video",
-                "case_id": item.get("case_id"),
-                "worker_id": item.get("worker_id"),
-                "jurisdiction": item.get("jurisdiction"),
-                "candidate_sightings": [],
-                "follow_up_jobs": [],
-            }
-        try:
-            payload = AnalyzeZoneRequest(**item)
-            async with slots:
-                result = await asyncio.to_thread(analyze_zone, payload)
-            return {"status": "completed", **result}
-        except HTTPException as exc:
-            return {
-                "status": "failed", "http_status": exc.status_code, "detail": exc.detail,
-                "case_id": item.get("case_id"), "worker_id": item.get("worker_id"),
-                "jurisdiction": item.get("jurisdiction"), "candidate_sightings": [],
-            }
-        except Exception as exc:
-            return {
-                "status": "failed", "http_status": 500, "detail": f"{type(exc).__name__}: {exc}",
-                "case_id": item.get("case_id"), "worker_id": item.get("worker_id"),
-                "jurisdiction": item.get("jurisdiction"), "candidate_sightings": [],
-            }
-
-    results = await asyncio.gather(*(run_item(item) for item in request.items))
-    return {
-        "worker_count": len(results),
-        "inference_concurrency_limit": VIDEO_WORKER_CONCURRENCY,
-        "results": results,
-    }
+async def analyze_zones(request: AnalyzeZonesRequest, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/zone/analyze")
-def analyze_zone(request: AnalyzeZoneRequest, _: str = Depends(require_api_access)):
-    db.initialize()
-    with db.connection() as conn:
-        case = _case_or_404(conn, request.case_id)
-        video = conn.execute("SELECT case_id,jurisdiction FROM videos WHERE video_source_id=?", (request.video_source_id,)).fetchone()
-        if request.jurisdiction not in _case_zones(case):
-            raise HTTPException(status_code=422, detail="Jurisdiction is not part of this case's zone map")
-        if video is None:
-            raise HTTPException(status_code=404, detail="video_source_id is not registered in the local evidence store")
-        if video["case_id"] != request.case_id or video["jurisdiction"] != request.jurisdiction:
-            raise HTTPException(status_code=409, detail="Video case or jurisdiction does not match this worker assignment")
-        job_id = str(uuid.uuid4())
-        now = db.utc_now()
-        conn.execute("INSERT INTO investigation_jobs(id,case_id,jurisdiction,video_source_id,worker_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (job_id, request.case_id, request.jurisdiction, request.video_source_id, request.worker_id, "processing", now, now))
-    try:
-        result = _analyze_zone(request)
-    except Exception as exc:
-        with db.connection() as conn:
-            conn.execute("UPDATE investigation_jobs SET status=?,error_detail=?,updated_at=? WHERE id=?",
-                         ("failed", str(getattr(exc, "detail", type(exc).__name__))[:1000], db.utc_now(), job_id))
-        raise
-    with db.connection() as conn:
-        conn.execute("UPDATE investigation_jobs SET status=?,updated_at=? WHERE id=?", ("completed", db.utc_now(), job_id))
-    return {**result, "job_id": job_id}
+def analyze_zone(request: AnalyzeZoneRequest, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_token: str | None = None):
@@ -1065,10 +791,17 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
 
 @app.get("/api/v1/sightings")
 def list_sightings(case_id: str | None = None, review_status: str | None = None,
-                   all_detections: bool = False, _: str = Depends(require_reviewer)):
+                   all_detections: bool = False, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
-    query = "SELECT s.*,c.clues_json AS case_clues_json FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE 1=1"
-    params: list[str] = []
+    query = (
+        "SELECT s.id,s.case_id,s.job_id,s.worker_id,s.video_source_id,s.occurred_at,s.video_offset_seconds,"
+        "s.track_id,s.vehicle_type,s.vehicle_color,s.subject_type,s.visual_attributes_json,"
+        "s.clue_json,s.frame_path,s.frame_sha256,s.detector_confidence,s.clue_match_score,"
+        "s.evidence_sha256,s.review_status,s.reviewer_user_id,s.reviewed_at,s.review_note,s.created_at,"
+        "c.clues_json AS case_clues_json "
+        "FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE c.owner_id=?"
+    )
+    params: list[str] = [user.user_id]
     if case_id:
         query += " AND s.case_id=?"
         params.append(case_id)
@@ -1084,73 +817,53 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
     for row in rows:
         record = dict(row)
         clue_text = record.pop("case_clues_json")
-        sighting_clue = record.get("clue_json")
+        frame_path = record.pop("frame_path", None)
+        sighting_clue = record.pop("clue_json", None)
         record["clue"] = json.loads(sighting_clue) if sighting_clue else (json.loads(clue_text) if clue_text else None)
-        record["visual_attributes"] = json.loads(record["visual_attributes_json"] or "[]")
+        record["visual_attributes"] = json.loads(record.pop("visual_attributes_json") or "[]")
         record["subject_type"] = record["subject_type"] or record["vehicle_type"]
-        record["frame_url"] = f"/api/v1/sightings/{record['id']}/frame" if record.get("frame_path") else None
+        record["frame_url"] = f"/api/v1/sightings/{record['id']}/frame" if frame_path else None
         records.append(record)
     return records
 
 
 @app.post("/api/v1/sightings/{sighting_id}/review")
-def review_sighting(sighting_id: str, decision: ReviewDecision, _: str = Depends(require_reviewer)):
+def review_sighting(sighting_id: str, decision: ReviewDecision, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
-    dispatched_followups: list[str] = []
+    now = db.utc_now()
     with db.connection() as conn:
         row = conn.execute(
-            "SELECT s.id,s.case_id,s.subject_type,s.vehicle_type,s.jurisdiction,s.occurred_at,c.neighbors_json "
-            "FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE s.id=?",
-            (sighting_id,),
+            "SELECT s.id,s.case_id FROM sightings s JOIN cases c ON c.case_id=s.case_id "
+            "WHERE s.id=? AND c.owner_id=?",
+            (sighting_id, user.user_id),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Sighting not found")
-        conn.execute("UPDATE sightings SET review_status=?,reviewer=?,review_note=? WHERE id=?",
-                     (decision.decision, decision.reviewer, decision.note, sighting_id))
-        db.audit(conn, "human_review_recorded", {"sighting_id": sighting_id, "case_id": row["case_id"], **decision.model_dump()})
-        subject_type = row["subject_type"] or row["vehicle_type"]
-        if decision.decision == "confirmed_candidate" and subject_type == "person":
-            neighbor_map = json.loads(row["neighbors_json"])
-            start = _parse_timestamp(row["occurred_at"])
-            end = start + timedelta(minutes=10)
-            for zone in dict.fromkeys(neighbor_map.get(row["jurisdiction"], [])):
-                if not zone or zone == row["jurisdiction"]:
-                    continue
-                video = _matching_video_for_window(conn, row["case_id"], zone, start, end)
-                followup_id = str(uuid.uuid4())
-                cursor = conn.execute(
-                    "INSERT OR IGNORE INTO followups(id,case_id,source_sighting_id,target_zone,window_start,window_end,video_source_id,status,created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (followup_id, row["case_id"], sighting_id, zone, _iso(start), _iso(end),
-                     video["video_source_id"] if video else None,
-                     "pending" if video else "awaiting_video", db.utc_now()),
-                )
-                if cursor.rowcount:
-                    dispatched_followups.append(zone)
-            if dispatched_followups:
-                db.audit(conn, "person_candidate_followups_queued", {
-                    "sighting_id": sighting_id, "case_id": row["case_id"],
-                    "target_zones": dispatched_followups, "human_review_gated": True,
-                })
-    return {"sighting_id": sighting_id, "review_status": decision.decision, "reviewer": decision.reviewer,
-            "follow_up_zones_queued": dispatched_followups}
+        conn.execute(
+            "UPDATE sightings SET review_status=?,reviewer=?,reviewer_user_id=?,reviewed_at=?,review_note=? WHERE id=?",
+            (decision.decision, user.user_id, user.user_id, now, decision.note, sighting_id),
+        )
+        db.audit(
+            conn,
+            "human_review_recorded",
+            {"sighting_id": sighting_id, "case_id": row["case_id"], "decision": decision.decision, "reviewer": user.user_id, "note": decision.note},
+        )
+    return {"sighting_id": sighting_id, "review_status": decision.decision, "reviewer_user_id": user.user_id, "reviewed_at": now}
 
 
 @app.get("/api/v1/sightings/{sighting_id}/reviews")
-def review_history(sighting_id: str, _: str = Depends(require_reviewer)):
+def review_history(sighting_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
     with db.connection() as conn:
-        if not conn.execute("SELECT id FROM sightings WHERE id=?", (sighting_id,)).fetchone():
+        owned = conn.execute(
+            "SELECT s.id FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE s.id=? AND c.owner_id=?",
+            (sighting_id, user.user_id),
+        ).fetchone()
+        if not owned:
             raise HTTPException(status_code=404, detail="Sighting not found")
         events = conn.execute("SELECT payload_json,created_at FROM audit_log WHERE event_type=? ORDER BY id DESC",
                               ("human_review_recorded",)).fetchall()
-        imported = []
-        if isinstance(conn, db.PostgresConnection):
-            table = conn.execute("SELECT to_regclass('imported_sqlite_audit') AS name").fetchone()
-            if table["name"]:
-                imported = conn.execute("SELECT payload_json,created_at FROM imported_sqlite_audit WHERE event_type=? ORDER BY original_id DESC",
-                                        ("human_review_recorded",)).fetchall()
     history = []
-    for event in [*events, *imported]:
+    for event in events:
         payload = json.loads(event["payload_json"])
         if payload.get("sighting_id") == sighting_id:
             history.append({"reviewer": payload.get("reviewer"), "decision": payload.get("decision"),
@@ -1159,150 +872,21 @@ def review_history(sighting_id: str, _: str = Depends(require_reviewer)):
 
 
 @app.get("/api/v1/followups")
-def list_followups(case_id: str | None = None, status: str | None = None, _: str = Depends(require_reviewer)):
-    db.initialize()
-    query = "SELECT * FROM followups WHERE 1=1"
-    params: list[str] = []
-    if case_id:
-        query += " AND case_id=?"
-        params.append(case_id)
-    if status:
-        query += " AND status=?"
-        params.append(status)
-    query += " ORDER BY created_at"
-    with db.connection() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+def list_followups(case_id: str | None = None, status: str | None = None, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/followups/ready")
-def ready_followups(case_id: str | None = None, _: str = Depends(require_api_access)):
-    """Return actual, locally registered follow-up work for n8n to fan out to zone workers."""
-    db.initialize()
-    query = """
-        SELECT f.*, c.neighbors_json, c.clues_json, v.camera_id, v.recorded_at, v.sha256
-        FROM followups f
-        JOIN cases c ON c.case_id=f.case_id
-        JOIN videos v ON v.video_source_id=f.video_source_id
-        WHERE f.status='pending' AND f.video_source_id IS NOT NULL
-    """
-    params: list[str] = []
-    if case_id:
-        query += " AND f.case_id=?"
-        params.append(case_id)
-    query += " ORDER BY f.created_at"
-    with db.connection() as conn:
-        rows = conn.execute(query, params).fetchall()
-    ready = []
-    for row in rows:
-        neighbor_map = json.loads(row["neighbors_json"])
-        ready.append({
-            "followup_id": row["id"], "case_id": row["case_id"],
-            "worker_id": f"zone_worker_{row['target_zone'].lower().replace(' ', '_')}",
-            "jurisdiction": row["target_zone"], "video_source_id": row["video_source_id"],
-            "camera_id": row["camera_id"], "recorded_at": row["recorded_at"],
-            "video_sha256": row["sha256"], "window_start": row["window_start"], "window_end": row["window_end"],
-            "neighbors": neighbor_map.get(row["target_zone"], []),
-            "clue": json.loads(row["clues_json"]) if row["clues_json"] else None,
-            "analysis_url": "/api/v1/followups/{followup_id}/analyze".format(followup_id=row["id"]),
-        })
-    return {"count": len(ready), "items": ready}
+def ready_followups(case_id: str | None = None, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.post("/api/v1/followups/{followup_id}/analyze")
-def analyze_followup(followup_id: str, _: str = Depends(require_api_access)):
-    """Claim and analyze a follow-up only when its real local clip is registered."""
-    db.initialize()
-    with db.connection() as conn:
-        row = conn.execute(
-            "SELECT f.*,c.neighbors_json,c.clues_json FROM followups f JOIN cases c ON c.case_id=f.case_id WHERE f.id=?",
-            (followup_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Follow-up job not found")
-        if row["status"] != "pending" or not row["video_source_id"]:
-            raise HTTPException(status_code=409, detail="Follow-up is not ready for analysis")
-        updated = conn.execute(
-            "UPDATE followups SET status='processing' WHERE id=? AND status='pending'",
-            (followup_id,),
-        )
-        if updated.rowcount != 1:
-            raise HTTPException(status_code=409, detail="Follow-up is already being processed")
-        payload = {
-            "case_id": row["case_id"],
-            "worker_id": f"zone_worker_{row['target_zone'].lower().replace(' ', '_')}",
-            "jurisdiction": row["target_zone"], "video_source_id": row["video_source_id"],
-            "neighbors": json.loads(row["neighbors_json"]).get(row["target_zone"], []),
-            "clue": json.loads(row["clues_json"]) if row["clues_json"] else None,
-        }
-    try:
-        result = analyze_zone(AnalyzeZoneRequest(**payload))
-    except Exception as exc:
-        with db.connection() as conn:
-            conn.execute("UPDATE followups SET status='failed' WHERE id=? AND status='processing'", (followup_id,))
-            db.audit(conn, "followup_analysis_failed", {"followup_id": followup_id, "error_type": type(exc).__name__})
-        raise
-    with db.connection() as conn:
-        conn.execute("UPDATE followups SET status='completed' WHERE id=? AND status='processing'", (followup_id,))
-        db.audit(conn, "followup_analysis_completed", {"followup_id": followup_id, "sighting_count": len(result["candidate_sightings"])})
-    return {"followup_id": followup_id, **result}
+def analyze_followup(followup_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
 
 @app.get("/api/v1/integrity")
-def integrity_status(_: str = Depends(require_api_access)):
-    db.initialize()
-    invalid_files: list[str] = []
-    missing_files: list[str] = []
-    invalid_sightings: list[str] = []
-    with db.connection() as conn:
-        videos = conn.execute("SELECT video_source_id,file_path,sha256 FROM videos").fetchall()
-        for video in videos:
-            path = Path(video["file_path"])
-            if not path.is_file():
-                missing_files.append(video["video_source_id"])
-                continue
-            digest = hashlib.sha256()
-            with path.open("rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            if digest.hexdigest() != video["sha256"]:
-                invalid_files.append(video["video_source_id"])
-        sightings = conn.execute(
-            "SELECT s.*,v.sha256 AS video_sha256 FROM sightings s JOIN videos v ON v.video_source_id=s.video_source_id"
-        ).fetchall()
-        for sighting in sightings:
-            payload = {
-                "video_sha256": sighting["video_sha256"], "case_id": sighting["case_id"], "worker_id": sighting["worker_id"],
-                "jurisdiction": sighting["jurisdiction"], "camera_id": sighting["camera_id"], "occurred_at": sighting["occurred_at"],
-                "video_offset_seconds": sighting["video_offset_seconds"], "vehicle_type": sighting["vehicle_type"],
-                "vehicle_color": sighting["vehicle_color"], "detector_confidence": sighting["detector_confidence"],
-            }
-            if int(sighting["integrity_version"] or 1) >= 2:
-                payload["subject_type"] = sighting["subject_type"]
-                payload["visual_attributes"] = json.loads(sighting["visual_attributes_json"])
-            if int(sighting["integrity_version"] or 1) >= 3:
-                frame_path = sighting["frame_path"]
-                frame_sha = None
-                if frame_path and Path(frame_path).is_file():
-                    frame_sha = hashlib.sha256(Path(frame_path).read_bytes()).hexdigest()
-                payload["frame_sha256"] = frame_sha
-                if frame_sha != sighting["frame_sha256"]:
-                    invalid_sightings.append(sighting["id"])
-            if int(sighting["integrity_version"] or 1) >= 4:
-                payload["clue"] = json.loads(sighting["clue_json"]) if sighting["clue_json"] else None
-            expected = hashlib.sha256((sighting["video_sha256"] + db.canonical_json(payload)).encode("utf-8")).hexdigest()
-            if expected != sighting["evidence_sha256"]:
-                invalid_sightings.append(sighting["id"])
-    audit_valid = db.verify_audit_chain()
-    files_valid = not invalid_files and not missing_files
-    sightings_valid = not invalid_sightings
-    return {
-        "valid": audit_valid and files_valid and sightings_valid,
-        "audit_chain_valid": audit_valid,
-        "evidence_files_valid": files_valid,
-        "missing_video_ids": missing_files,
-        "modified_video_ids": invalid_files,
-        "sighting_hashes_valid": sightings_valid,
-        "invalid_sighting_ids": invalid_sightings,
-    }
+def integrity_status(user: AuthenticatedUser = Depends(require_approved_officer)):
+    _legacy_disabled()
 
