@@ -52,9 +52,9 @@ def _dominant_color(frame, xyxy: list[float], target_type: str) -> str | None:
         return "black"
     if s < 30:
         return "white" if v > 190 else "gray"
-    if h < 8 or h >= 170:
+    if h < 12 or h >= 165:
         return "red"
-    if h < 20:
+    if h < 24:
         return "orange"
     if h < 35:
         return "yellow"
@@ -130,20 +130,25 @@ def analyze_video(path: str | Path, recorded_at: datetime | None, confidence: fl
                     current["vehicle_type"] = target_type
                     current["visual_attributes"] = ([f"approximate torso color: {color}"] if target_type == "person" and color else [])
             if confidence_value >= tracks[key]["detector_confidence"]:
+                orig_h, orig_w = frame.shape[:2]
                 x1, y1, x2, y2 = [int(value) for value in xyxys[index]]
-                evidence_frame = frame.copy()
-                cv2.rectangle(evidence_frame, (x1, y1), (x2, y2), (40, 220, 120), max(2, evidence_frame.shape[1] // 900))
-                label_time = frame_time.isoformat(timespec="seconds") if frame_time is not None else f"+{offset_sec:.1f}s"
-                label = f"{target_type} {confidence_value:.2f} | {label_time}"
-                cv2.putText(evidence_frame, label, (max(8, x1), max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX,
-                            max(0.55, evidence_frame.shape[1] / 1800), (40, 220, 120), 2, cv2.LINE_AA)
-                # Preserve the source frame with a visible detector box, not a video seek link.
-                scale = min(1.0, 1280 / max(evidence_frame.shape[:2]))
+                scale = min(1.0, 1280 / max(orig_h, orig_w))
                 if scale < 1.0:
-                    evidence_frame = cv2.resize(evidence_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                encoded, jpeg = cv2.imencode(".jpg", evidence_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+                    clean_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                    scaled_bbox = [int(round(x1 * scale)), int(round(y1 * scale)), int(round(x2 * scale)), int(round(y2 * scale))]
+                else:
+                    clean_frame = frame.copy()
+                    scaled_bbox = [x1, y1, x2, y2]
+                # Preserve the clean untouched raw source frame without burnt annotations for forensic integrity
+                encoded, jpeg = cv2.imencode(".jpg", clean_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                 if encoded:
                     tracks[key]["frame_jpeg"] = jpeg.tobytes()
                     tracks[key]["frame_offset_seconds"] = frame_index / fps
+                    tracks[key]["bbox"] = [x1, y1, x2, y2]
+                    tracks[key]["scaled_bbox"] = scaled_bbox
+                    tracks[key]["frame_width"] = orig_w
+                    tracks[key]["frame_height"] = orig_h
+                    tracks[key]["saved_frame_width"] = clean_frame.shape[1]
+                    tracks[key]["saved_frame_height"] = clean_frame.shape[0]
     return list(tracks.values())
 

@@ -51,6 +51,8 @@ class Phase5OrchestrationAndWorkerTests(unittest.TestCase):
                 "DATABASE_URL": "",
                 "APP_DATA_DIR": str(self.root),
                 "SUPABASE_URL": TEST_SUPABASE_URL,
+                "SUPABASE_SERVICE_ROLE_KEY": "",
+                "SUPABASE_SECRET_KEY": "",
                 "SUPABASE_JWT_AUDIENCE": "authenticated",
                 "YOLO_DEVICE": "cpu",
             },

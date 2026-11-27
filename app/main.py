@@ -1103,32 +1103,70 @@ def get_video_file(
 
 
 @app.get("/api/v1/sightings/{sighting_id}/frame")
-def get_sighting_frame(sighting_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+def get_sighting_frame(sighting_id: str, annotated: bool = False, user: AuthenticatedUser = Depends(require_approved_officer)):
     from fastapi.responses import Response
     from .storage import StorageConfigError, StorageOperationError, SupabaseEvidenceStorage
 
     db.initialize()
     with db.connection() as conn:
         row = conn.execute(
-            "SELECT s.frame_path, s.frame_storage_key FROM sightings s JOIN cases c ON c.case_id=s.case_id "
+            "SELECT s.frame_path, s.frame_storage_key, s.visual_attributes_json, s.subject_type, s.vehicle_type, s.detector_confidence "
+            "FROM sightings s JOIN cases c ON c.case_id=s.case_id "
             "WHERE s.id=? AND c.owner_id=?",
             (sighting_id, user.user_id),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
     evidence_root = db.EVIDENCE_DIR.resolve(strict=False)
+    raw_bytes: bytes | None = None
     if row["frame_path"]:
         frame_path = Path(row["frame_path"]).resolve(strict=False)
         if frame_path.is_relative_to(evidence_root) and frame_path.is_file():
-            return FileResponse(frame_path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
-    if row["frame_storage_key"]:
+            raw_bytes = frame_path.read_bytes()
+    if raw_bytes is None and row["frame_storage_key"]:
         try:
             storage = SupabaseEvidenceStorage()
-            data = storage.download_frame(row["frame_storage_key"])
-            return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+            raw_bytes = storage.download_frame(row["frame_storage_key"])
         except (StorageConfigError, StorageOperationError):
             pass
-    raise HTTPException(status_code=404, detail="No still frame was captured for this stored candidate; rerun the clip search to create one")
+    if raw_bytes is None:
+        raise HTTPException(status_code=404, detail="No still frame was captured for this stored candidate; rerun the clip search to create one")
+
+    if not annotated:
+        return Response(content=raw_bytes, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+    # Dynamic annotated preview for Phase 6 review
+    try:
+        import cv2
+        import numpy as np
+
+        nparr = np.frombuffer(raw_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is not None:
+            attrs = json.loads(row["visual_attributes_json"] or "{}")
+            bbox = attrs.get("scaled_bbox") or attrs.get("bbox") if isinstance(attrs, dict) else None
+            if bbox and len(bbox) == 4:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                cv2.rectangle(img, (x1, y1), (x2, y2), (40, 220, 120), max(2, img.shape[1] // 900))
+                label_type = row["subject_type"] or row["vehicle_type"] or "target"
+                conf = float(row["detector_confidence"] or 0.0)
+                label = f"{label_type} {conf:.2f}"
+                cv2.putText(
+                    img,
+                    label,
+                    (max(8, x1), max(24, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.55, img.shape[1] / 1800),
+                    (40, 220, 120),
+                    2,
+                    cv2.LINE_AA,
+                )
+                encoded, jpeg = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                if encoded:
+                    return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300"})
+    except Exception:
+        pass
+    return Response(content=raw_bytes, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 
 @app.post("/api/v1/zones/analyze")
@@ -1245,6 +1283,24 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
                 else str(uuid.uuid4())
             )
             visual_attributes = detection.get("visual_attributes") or []
+            bbox = detection.get("bbox")
+            scaled_bbox = detection.get("scaled_bbox") or bbox
+            frame_w = detection.get("frame_width")
+            frame_h = detection.get("frame_height")
+            saved_w = detection.get("saved_frame_width") or frame_w
+            saved_h = detection.get("saved_frame_height") or frame_h
+            attr_payload = {
+                "tags": visual_attributes if isinstance(visual_attributes, list) else [],
+                "bbox": bbox,
+                "scaled_bbox": scaled_bbox,
+                "frame_width": frame_w,
+                "frame_height": frame_h,
+                "saved_frame_width": saved_w,
+                "saved_frame_height": saved_h,
+                "target_type": subject_type,
+                "color": detection.get("vehicle_color"),
+                "confidence": detection.get("detector_confidence"),
+            }
             frame_bytes = detection.get("frame_jpeg")
             occurred = _iso(recorded_dt + timedelta(seconds=frame_offset)) if recorded_dt is not None else None
             frame_path = None
@@ -1276,7 +1332,7 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
                 "vehicle_color": detection.get("vehicle_color"),
                 "detector_confidence": detection["detector_confidence"],
                 "subject_type": subject_type,
-                "visual_attributes": visual_attributes,
+                "visual_attributes": attr_payload,
                 "frame_sha256": frame_sha256,
                 "clue": clue,
             }
@@ -1299,7 +1355,7 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
                     detection["vehicle_type"],
                     detection.get("vehicle_color"),
                     subject_type,
-                    db.canonical_json(visual_attributes),
+                    db.canonical_json(attr_payload),
                     4,
                     db.canonical_json(clue) if clue else None,
                     str(frame_path) if frame_path else None,
@@ -1404,9 +1460,41 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
         frame_path = record.pop("frame_path", None)
         sighting_clue = record.pop("clue_json", None)
         record["clue"] = json.loads(sighting_clue) if sighting_clue else (json.loads(clue_text) if clue_text else None)
-        record["visual_attributes"] = json.loads(record.pop("visual_attributes_json") or "[]")
+        raw_attrs = record.pop("visual_attributes_json", None)
+        attrs = {}
+        if raw_attrs:
+            try:
+                attrs = json.loads(raw_attrs)
+            except Exception:
+                attrs = {}
+        if isinstance(attrs, dict):
+            record["visual_attributes"] = attrs.get("tags", [])
+            record["bbox"] = attrs.get("bbox")
+            record["scaled_bbox"] = attrs.get("scaled_bbox")
+            record["frame_width"] = attrs.get("frame_width")
+            record["frame_height"] = attrs.get("frame_height")
+            record["saved_frame_width"] = attrs.get("saved_frame_width")
+            record["saved_frame_height"] = attrs.get("saved_frame_height")
+        elif isinstance(attrs, list):
+            record["visual_attributes"] = attrs
+            record["bbox"] = None
+            record["scaled_bbox"] = None
+            record["frame_width"] = None
+            record["frame_height"] = None
+            record["saved_frame_width"] = None
+            record["saved_frame_height"] = None
+        else:
+            record["visual_attributes"] = []
+            record["bbox"] = None
+            record["scaled_bbox"] = None
+            record["frame_width"] = None
+            record["frame_height"] = None
+            record["saved_frame_width"] = None
+            record["saved_frame_height"] = None
         record["subject_type"] = record["subject_type"] or record["vehicle_type"]
-        record["frame_url"] = f"/api/v1/sightings/{record['id']}/frame" if frame_path else None
+        has_frame = bool(frame_path or record.get("frame_storage_key"))
+        record["frame_url"] = f"/api/v1/sightings/{record['id']}/frame" if has_frame else None
+        record["annotated_frame_url"] = f"/api/v1/sightings/{record['id']}/frame?annotated=true" if has_frame else None
         records.append(record)
     return records
 

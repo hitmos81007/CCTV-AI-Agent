@@ -152,14 +152,13 @@ def _sanitize_clue_payload(parsed: dict, description: str) -> dict:
     if isinstance(vehicle_type, str) and not _is_safe_text(vehicle_type):
         vehicle_type = None
 
-    # Filter unsupported_requests so the model cannot echo unrequested unsupported terms from the system prompt
+    # Filter unsupported_requests and preserve all detected unsupported requests
     verified_unsupported: list[str] = []
     for item in unsupported:
         if not isinstance(item, str) or not _is_safe_text(item):
             continue
         norm = item.strip().replace("_", " ")
-        tokens = [tok for tok in norm.casefold().split() if len(tok) > 2]
-        if tokens and any(tok in desc_lower for tok in tokens):
+        if norm and not any(norm.casefold() in u.casefold() for u in verified_unsupported):
             verified_unsupported.append(norm)
 
     return {

@@ -46,7 +46,17 @@ class PhaseFourIngestionAndAuthTests(unittest.TestCase):
             patch.object(db, "DATA_DIR", self.root),
             patch.object(db, "EVIDENCE_DIR", self.root / "evidence"),
             patch.object(db, "DB_PATH", self.root / "phase4.sqlite3"),
-            patch.dict(os.environ, {"SUPABASE_URL": TEST_SUPABASE_URL, "SUPABASE_JWT_AUDIENCE": "authenticated"}),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "",
+                    "CCTV_ENV": "test",
+                    "SUPABASE_URL": TEST_SUPABASE_URL,
+                    "SUPABASE_JWT_AUDIENCE": "authenticated",
+                    "SUPABASE_SERVICE_ROLE_KEY": "",
+                    "SUPABASE_SECRET_KEY": "",
+                },
+            ),
             patch.object(self.verifier, "_fetch_jwks", return_value=test_jwks()),
             patch("app.auth.get_jwt_verifier", return_value=self.verifier),
         ]
