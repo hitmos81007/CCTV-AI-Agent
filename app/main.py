@@ -750,6 +750,12 @@ async def parse_clues(request: ClueParseRequest, user: AuthenticatedUser = Depen
     db.initialize()
     with db.connection() as conn:
         case = owned_case_or_404(conn, request.case_id, user.user_id)
+        state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (request.case_id,)).fetchone()
+        if state and state["status"] != "draft":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Investigation criteria cannot be modified once processing has begun. Current status: '{state['status']}'",
+            )
         saved_initial_zone = case["initial_zone"]
         previous_clue_json = case["clues_json"]
     try:
@@ -761,13 +767,29 @@ async def parse_clues(request: ClueParseRequest, user: AuthenticatedUser = Depen
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail="Ollama response did not match the clue schema") from exc
     with db.connection() as conn:
+        state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (request.case_id,)).fetchone()
+        if state and state["status"] != "draft":
+            raise HTTPException(
+                status_code=409,
+                detail="Investigation criteria cannot be modified once processing has begun",
+            )
         if previous_clue_json:
             conn.execute("UPDATE sightings SET clue_json=? WHERE case_id=? AND clue_json IS NULL",
                          (previous_clue_json, request.case_id))
-        conn.execute("UPDATE cases SET description=?,clues_json=?,updated_at=? WHERE case_id=? AND owner_id=?",
-                     (request.description, clue.model_dump_json(), db.utc_now(), request.case_id, user.user_id))
+        cur = conn.execute(
+            "UPDATE cases SET description=?,clues_json=?,updated_at=? "
+            "WHERE case_id=? AND owner_id=? AND "
+            "(SELECT status FROM investigation_states WHERE case_id=cases.case_id) = 'draft'",
+            (request.description, clue.model_dump_json(), db.utc_now(), request.case_id, user.user_id),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Investigation criteria cannot be modified once processing has begun",
+            )
         db.audit(conn, "case_clue_updated", {"case_id": request.case_id, "owner_id": user.user_id,
                                                "parser": clue.parser, "clue": clue.model_dump()})
+        db.emit_case_event(conn, request.case_id, "case_changed")
     return clue.model_dump()
 
 
@@ -1110,7 +1132,7 @@ def get_sighting_frame(sighting_id: str, annotated: bool = False, user: Authenti
     db.initialize()
     with db.connection() as conn:
         row = conn.execute(
-            "SELECT s.frame_path, s.frame_storage_key, s.visual_attributes_json, s.subject_type, s.vehicle_type, s.detector_confidence "
+            "SELECT s.frame_path, s.frame_storage_key, s.frame_sha256, s.visual_attributes_json, s.subject_type, s.vehicle_type, s.detector_confidence "
             "FROM sightings s JOIN cases c ON c.case_id=s.case_id "
             "WHERE s.id=? AND c.owner_id=?",
             (sighting_id, user.user_id),
@@ -1130,43 +1152,102 @@ def get_sighting_frame(sighting_id: str, annotated: bool = False, user: Authenti
         except (StorageConfigError, StorageOperationError):
             pass
     if raw_bytes is None:
-        raise HTTPException(status_code=404, detail="No still frame was captured for this stored candidate; rerun the clip search to create one")
+        raise HTTPException(status_code=404, detail="No unannotated captured evidence frame found for this stored candidate")
+
+    # Authoritative evidence hash verification (Task 6.0 A)
+    expected_sha256 = row["frame_sha256"] if "frame_sha256" in row.keys() else None
+    if not expected_sha256:
+        raise HTTPException(
+            status_code=409,
+            detail="Captured evidence integrity check failed: missing stored frame hash",
+        )
+    actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Captured evidence integrity check failed: stored frame hash mismatch ({actual_sha256} != {expected_sha256})",
+        )
+
+    # Secure, no-store cache control headers to prevent stale evidence persistence (Task 6.0 A)
+    base_headers = {
+        "Cache-Control": "private, no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "X-Frame-SHA256": actual_sha256,
+        "X-Evidence-Integrity": "verified",
+    }
 
     if not annotated:
-        return Response(content=raw_bytes, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+        return Response(
+            content=raw_bytes,
+            media_type="image/jpeg",
+            headers={**base_headers, "X-Evidence-Type": "unannotated_captured_frame"},
+        )
 
-    # Dynamic annotated preview for Phase 6 review
+    # Dynamic annotated evidence visualization (Task 6.0 E)
+    import cv2
+    import numpy as np
+
+    nparr = np.frombuffer(raw_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=500, detail="Failed to decode captured evidence frame for annotation")
+
+    attrs = {}
+    if row["visual_attributes_json"]:
+        try:
+            attrs = json.loads(row["visual_attributes_json"])
+        except Exception:
+            attrs = {}
+
+    bbox = None
+    if isinstance(attrs, dict):
+        bbox = attrs.get("scaled_bbox") or attrs.get("bbox")
+
+    if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        raise HTTPException(
+            status_code=422,
+            detail="Bounding-box annotation metadata is unavailable for this captured evidence frame",
+        )
+
+    img_h, img_w = img.shape[:2]
     try:
-        import cv2
-        import numpy as np
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Bounding-box coordinates must be numeric values",
+        ) from exc
 
-        nparr = np.frombuffer(raw_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is not None:
-            attrs = json.loads(row["visual_attributes_json"] or "{}")
-            bbox = attrs.get("scaled_bbox") or attrs.get("bbox") if isinstance(attrs, dict) else None
-            if bbox and len(bbox) == 4:
-                x1, y1, x2, y2 = [int(v) for v in bbox]
-                cv2.rectangle(img, (x1, y1), (x2, y2), (40, 220, 120), max(2, img.shape[1] // 900))
-                label_type = row["subject_type"] or row["vehicle_type"] or "target"
-                conf = float(row["detector_confidence"] or 0.0)
-                label = f"{label_type} {conf:.2f}"
-                cv2.putText(
-                    img,
-                    label,
-                    (max(8, x1), max(24, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    max(0.55, img.shape[1] / 1800),
-                    (40, 220, 120),
-                    2,
-                    cv2.LINE_AA,
-                )
-                encoded, jpeg = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                if encoded:
-                    return Response(content=jpeg.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300"})
-    except Exception:
-        pass
-    return Response(content=raw_bytes, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    # Validate coordinates against actual image dimensions (Task 6.0 E)
+    if x1 < 0 or y1 < 0 or x2 > img_w or y2 > img_h or x1 >= x2 or y1 >= y2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Bounding-box coordinates {[x1, y1, x2, y2]} are invalid or exceed frame dimensions ({img_w}x{img_h})",
+        )
+
+    cv2.rectangle(img, (x1, y1), (x2, y2), (40, 220, 120), max(2, img.shape[1] // 900))
+    label_type = row["subject_type"] or row["vehicle_type"] or "target"
+    conf = float(row["detector_confidence"] or 0.0)
+    label = f"{label_type} {conf:.2f}"
+    cv2.putText(
+        img,
+        label,
+        (max(8, x1), max(24, y1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.55, img.shape[1] / 1800),
+        (40, 220, 120),
+        2,
+        cv2.LINE_AA,
+    )
+    encoded, jpeg = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not encoded:
+        raise HTTPException(status_code=500, detail="Failed to encode annotated evidence visualization")
+
+    return Response(
+        content=jpeg.tobytes(),
+        media_type="image/jpeg",
+        headers={**base_headers, "X-Evidence-Type": "annotated_evidence_visualization"},
+    )
 
 
 @app.post("/api/v1/zones/analyze")
@@ -1413,6 +1494,9 @@ def _analyze_zone(request: AnalyzeZoneRequest, job_id: str | None = None, lease_
             )
             if finished.rowcount != 1:
                 raise RuntimeError("Processing lease was lost before evidence commit")
+            db.emit_case_event(conn, request.case_id, "job_changed")
+        if sightings:
+            db.emit_case_event(conn, request.case_id, "finding_changed")
     return {
         "case_id": request.case_id,
         "worker_id": request.worker_id,
@@ -1436,7 +1520,7 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
     query = (
         "SELECT s.id,s.case_id,s.job_id,s.worker_id,s.video_source_id,s.occurred_at,s.video_offset_seconds,"
         "s.track_id,s.vehicle_type,s.vehicle_color,s.subject_type,s.visual_attributes_json,"
-        "s.clue_json,s.frame_path,s.frame_sha256,s.detector_confidence,s.clue_match_score,"
+        "s.clue_json,s.frame_path,s.frame_storage_key,s.frame_sha256,s.detector_confidence,s.clue_match_score,"
         "s.evidence_sha256,s.review_status,s.reviewer_user_id,s.reviewed_at,s.review_note,s.created_at,"
         "c.clues_json AS case_clues_json "
         "FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE c.owner_id=?"
@@ -1456,8 +1540,9 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
     records = []
     for row in rows:
         record = dict(row)
-        clue_text = record.pop("case_clues_json")
+        clue_text = record.pop("case_clues_json", None)
         frame_path = record.pop("frame_path", None)
+        frame_storage_key = record.pop("frame_storage_key", None)
         sighting_clue = record.pop("clue_json", None)
         record["clue"] = json.loads(sighting_clue) if sighting_clue else (json.loads(clue_text) if clue_text else None)
         raw_attrs = record.pop("visual_attributes_json", None)
@@ -1492,7 +1577,8 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
             record["saved_frame_width"] = None
             record["saved_frame_height"] = None
         record["subject_type"] = record["subject_type"] or record["vehicle_type"]
-        has_frame = bool(frame_path or record.get("frame_storage_key"))
+        has_frame = bool(frame_path or frame_storage_key)
+        record["has_frame"] = has_frame
         record["frame_url"] = f"/api/v1/sightings/{record['id']}/frame" if has_frame else None
         record["annotated_frame_url"] = f"/api/v1/sightings/{record['id']}/frame?annotated=true" if has_frame else None
         records.append(record)
@@ -1503,43 +1589,123 @@ def list_sightings(case_id: str | None = None, review_status: str | None = None,
 def review_sighting(sighting_id: str, decision: ReviewDecision, user: AuthenticatedUser = Depends(require_approved_officer)):
     db.initialize()
     now = db.utc_now()
+    norm_decision = decision.decision.strip().lower()
+    if norm_decision in ("not_relevant", "rejected_candidate", "dismissed"):
+        norm_decision = "not_relevant"
+    elif norm_decision in ("confirmed_candidate", "confirmed"):
+        norm_decision = "confirmed_candidate"
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid review decision '{decision.decision}'. Must be 'confirmed_candidate' or 'not_relevant'",
+        )
+
+    request_key = (decision.request_key or f"rev_{sighting_id}_{uuid.uuid4().hex[:12]}").strip()
     with db.connection() as conn:
         row = conn.execute(
-            "SELECT s.id,s.case_id FROM sightings s JOIN cases c ON c.case_id=s.case_id "
+            "SELECT s.id, s.case_id, s.review_status FROM sightings s JOIN cases c ON c.case_id=s.case_id "
             "WHERE s.id=? AND c.owner_id=?",
             (sighting_id, user.user_id),
         ).fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail="Sighting not found")
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        # Idempotency check on finding_reviews (sighting_id, request_key)
+        existing = conn.execute(
+            "SELECT id, decision, note FROM finding_reviews WHERE sighting_id=? AND request_key=?",
+            (sighting_id, request_key),
+        ).fetchone()
+        if existing:
+            if existing["decision"] != norm_decision:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Idempotency conflict: review request_key '{request_key}' was already processed with decision '{existing['decision']}'",
+                )
+            return {
+                "sighting_id": sighting_id,
+                "review_status": existing["decision"],
+                "reviewer_user_id": user.user_id,
+                "reviewed_at": now,
+                "idempotent": True,
+            }
+
+        review_id = str(uuid.uuid4())
         conn.execute(
-            "UPDATE sightings SET review_status=?,reviewer=?,reviewer_user_id=?,reviewed_at=?,review_note=? WHERE id=?",
-            (decision.decision, user.user_id, user.user_id, now, decision.note, sighting_id),
+            "INSERT INTO finding_reviews(id, sighting_id, case_id, reviewer_user_id, decision, note, request_key, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (review_id, sighting_id, row["case_id"], user.user_id, norm_decision, decision.note, request_key, now),
+        )
+        conn.execute(
+            "UPDATE sightings SET review_status=?, reviewer=?, reviewer_user_id=?, reviewed_at=?, review_note=? WHERE id=?",
+            (norm_decision, user.user_id, user.user_id, now, decision.note, sighting_id),
         )
         db.audit(
             conn,
             "human_review_recorded",
-            {"sighting_id": sighting_id, "case_id": row["case_id"], "decision": decision.decision, "reviewer": user.user_id, "note": decision.note},
+            {
+                "review_id": review_id,
+                "sighting_id": sighting_id,
+                "case_id": row["case_id"],
+                "decision": norm_decision,
+                "reviewer": user.user_id,
+                "note": decision.note,
+                "request_key": request_key,
+            },
         )
-    return {"sighting_id": sighting_id, "review_status": decision.decision, "reviewer_user_id": user.user_id, "reviewed_at": now}
+        db.emit_case_event(conn, row["case_id"], "review_changed")
+        db.emit_case_event(conn, row["case_id"], "finding_changed")
+    return {"sighting_id": sighting_id, "review_status": norm_decision, "reviewer_user_id": user.user_id, "reviewed_at": now}
 
 
 @app.get("/api/v1/sightings/{sighting_id}/reviews")
 def review_history(sighting_id: str, user: AuthenticatedUser = Depends(require_approved_officer)):
+    db.initialize()
     with db.connection() as conn:
         owned = conn.execute(
-            "SELECT s.id FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE s.id=? AND c.owner_id=?",
+            "SELECT s.id, s.case_id FROM sightings s JOIN cases c ON c.case_id=s.case_id WHERE s.id=? AND c.owner_id=?",
             (sighting_id, user.user_id),
         ).fetchone()
         if not owned:
             raise HTTPException(status_code=404, detail="Sighting not found")
-        events = conn.execute("SELECT payload_json,created_at FROM audit_log WHERE event_type=? ORDER BY id DESC",
-                              ("human_review_recorded",)).fetchall()
+        rows = conn.execute(
+            "SELECT id, sighting_id, case_id, reviewer_user_id, decision, note, request_key, created_at "
+            "FROM finding_reviews WHERE sighting_id=? ORDER BY created_at DESC",
+            (sighting_id,),
+        ).fetchall()
+        if rows:
+            return [
+                {
+                    "id": r["id"],
+                    "sighting_id": r["sighting_id"],
+                    "reviewer": r["reviewer_user_id"],
+                    "decision": r["decision"],
+                    "note": r["note"] or "",
+                    "request_key": r["request_key"],
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
+        # Legacy audit log fallback
+        events = conn.execute(
+            "SELECT payload_json, created_at FROM audit_log WHERE event_type=? ORDER BY id DESC",
+            ("human_review_recorded",),
+        ).fetchall()
     history = []
     for event in events:
-        payload = json.loads(event["payload_json"])
-        if payload.get("sighting_id") == sighting_id:
-            history.append({"reviewer": payload.get("reviewer"), "decision": payload.get("decision"),
-                            "note": payload.get("note"), "created_at": event["created_at"]})
+        try:
+            payload = json.loads(event["payload_json"])
+            if payload.get("sighting_id") == sighting_id:
+                history.append({
+                    "id": payload.get("review_id"),
+                    "sighting_id": sighting_id,
+                    "reviewer": payload.get("reviewer"),
+                    "decision": payload.get("decision"),
+                    "note": payload.get("note") or "",
+                    "request_key": payload.get("request_key"),
+                    "created_at": event["created_at"],
+                })
+        except Exception:
+            pass
     return sorted(history, key=lambda item: item["created_at"], reverse=True)
 
 

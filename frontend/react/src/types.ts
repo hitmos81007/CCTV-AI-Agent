@@ -185,13 +185,44 @@ export interface Progress {
 export interface Sighting {
   id: string;
   case_id: string;
+  job_id?: string | null;
+  worker_id?: string | null;
   video_source_id: string;
   occurred_at: string | null;
   video_offset_seconds: number;
+  track_id?: number | null;
   vehicle_type: string;
   vehicle_color: string | null;
   subject_type: string;
+  visual_attributes?: string[];
   detector_confidence: number;
+  clue_match_score?: number;
+  evidence_sha256?: string;
+  frame_sha256?: string;
   review_status: string;
+  reviewer_user_id?: string | null;
+  reviewed_at?: string | null;
+  review_note?: string | null;
+  created_at?: string;
+  clue?: Record<string, unknown> | null;
+  bbox?: [number, number, number, number] | null;
+  scaled_bbox?: [number, number, number, number] | null;
+  frame_width?: number | null;
+  frame_height?: number | null;
+  saved_frame_width?: number | null;
+  saved_frame_height?: number | null;
+  has_frame?: boolean;
   frame_url: string | null;
+  annotated_frame_url?: string | null;
+}
+
+export interface FindingReview {
+  id: string;
+  sighting_id: string;
+  case_id?: string;
+  reviewer: string;
+  decision: "confirmed_candidate" | "not_relevant";
+  note: string;
+  request_key?: string;
+  created_at: string;
 }

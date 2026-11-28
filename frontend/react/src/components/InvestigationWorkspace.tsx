@@ -24,6 +24,8 @@ import {
   updateCaseDraft,
   uploadCaseVideo,
 } from "../api";
+import { supabase } from "../lib/supabase";
+import { FindingsGallery } from "./EvidenceReview";
 import { ErrorBanner, PageHeader, StatusChip } from "./Ui";
 import type { CaseVideo } from "../types";
 
@@ -91,16 +93,56 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
   const [dragOver, setDragOver] = useState(false);
 
   const [clips, setClips] = useState<QueuedClip[]>([]);
-  const [previewClip, setPreviewClip] = useState<{ title: string; url: string } | null>(null);
+  const [previewClip, setPreviewClip] = useState<{ title: string; url: string; seekOffset?: number } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [startingInvestigation, setStartingInvestigation] = useState(false);
   const [startError, setStartError] = useState("");
   const startKeyRef = useRef<string>(makeUuid());
+  const [realtimeState, setRealtimeState] = useState<"connected" | "fallback" | "disconnected">("fallback");
 
   useEffect(() => {
     setActiveCaseId(initialCaseId);
   }, [initialCaseId]);
+
+  // Realtime Supabase event subscription for active case
+  useEffect(() => {
+    const client = supabase;
+    if (!client || !activeCaseId) {
+      setRealtimeState("fallback");
+      return;
+    }
+    const channel = client
+      .channel(`case-events-${activeCaseId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "case_events",
+          filter: `case_id=eq.${activeCaseId}`,
+        },
+        (payload) => {
+          console.log("[Supabase Realtime] case_event received:", payload);
+          void queryClient.invalidateQueries({ queryKey: ["case-progress", activeCaseId] });
+          void queryClient.invalidateQueries({ queryKey: ["sightings", activeCaseId] });
+          void queryClient.invalidateQueries({ queryKey: ["case", activeCaseId] });
+          void queryClient.invalidateQueries({ queryKey: ["cases"] });
+        }
+      )
+      .subscribe((status, err) => {
+        console.log(`[Supabase Realtime] status for case-events-${activeCaseId}:`, status, err);
+        if (status === "SUBSCRIBED") {
+          setRealtimeState("connected");
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setRealtimeState("fallback");
+        }
+      });
+
+    return () => {
+      void client.removeChannel(channel);
+    };
+  }, [activeCaseId, queryClient]);
 
   const caseQuery = useQuery({
     queryKey: ["case", activeCaseId],
@@ -444,6 +486,26 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
     }
   };
 
+  const handlePlaySource = async (videoSourceId: string, offsetSeconds: number) => {
+    try {
+      setPreviewError("");
+      setPreviewLoading(true);
+      const blob = await fetchVideoPlaybackBlob(videoSourceId);
+      if (previewClip?.url) URL.revokeObjectURL(previewClip.url);
+      const matched = clips.find((c) => c.persisted?.video_source_id === videoSourceId);
+      const label = matched?.persisted?.source_label || matched?.persisted?.original_name || "Source CCTV Clip";
+      setPreviewClip({
+        title: `${label} • Seeking to ${offsetSeconds.toFixed(1)}s`,
+        url: URL.createObjectURL(blob),
+        seekOffset: offsetSeconds,
+      });
+    } catch (err) {
+      setPreviewError(err instanceof Error ? err.message : "Unable to load video playback stream.");
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   const stats = useMemo(() => {
     const ready = clips.filter((c) => c.status === "ready");
     const failed = clips.filter((c) => c.status === "failed");
@@ -510,7 +572,32 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
             ? `Case ID: ${activeCaseId} • Persisted draft & multi-video ingestion workspace`
             : "Create an authorized investigation and upload demonstration CCTV recordings"
         }
-        action={activeCaseId ? <StatusChip status={caseStatus} /> : undefined}
+        action={
+          activeCaseId ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <div
+                className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium border ${
+                  realtimeState === "connected"
+                    ? "border-emerald-500/40 bg-emerald-950/30 text-[#5EE0AD]"
+                    : "border-amber-500/40 bg-amber-950/30 text-amber-300"
+                }`}
+                title={
+                  realtimeState === "connected"
+                    ? "Live WebSocket connection to Supabase Realtime case events"
+                    : "Automatic 3s polling active for case and job changes"
+                }
+              >
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    realtimeState === "connected" ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
+                  }`}
+                />
+                {realtimeState === "connected" ? "Realtime Connected" : "Polling Active (3s)"}
+              </div>
+              <StatusChip status={caseStatus} />
+            </div>
+          ) : undefined
+        }
       />
 
       {caseQuery.error && (
@@ -870,6 +957,11 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
               </div>
             )}
           </section>
+
+          {/* C. Candidate Observations & Evidence Review */}
+          {activeCaseId && (
+            <FindingsGallery caseId={activeCaseId} onPlaySource={handlePlaySource} />
+          )}
         </div>
 
         {/* Right column: C. Readiness Panel + D. Submission */}
@@ -1079,7 +1171,17 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
                 Close
               </button>
             </div>
-            <video src={previewClip.url} controls autoPlay className="max-h-[70vh] w-full rounded-lg bg-black" />
+            <video
+              ref={(el) => {
+                if (el && previewClip.seekOffset !== undefined) {
+                  el.currentTime = previewClip.seekOffset;
+                }
+              }}
+              src={previewClip.url}
+              controls
+              autoPlay
+              className="max-h-[70vh] w-full rounded-lg bg-black"
+            />
           </div>
         </div>
       )}

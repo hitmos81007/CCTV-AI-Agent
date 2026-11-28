@@ -8,6 +8,7 @@ import type {
   CaseSummary,
   CaseVideo,
   District,
+  FindingReview,
   OfficerProfile,
   Progress,
   Sighting,
@@ -296,6 +297,45 @@ export function startInvestigation(caseId: string, idempotencyKey: string): Prom
   });
 }
 
-export function fetchSightings(caseId: string): Promise<Sighting[]> {
-  return apiRequest(`/api/v1/sightings?case_id=${encodeURIComponent(caseId)}`);
+export function fetchSightings(
+  caseId: string,
+  options?: { reviewStatus?: string; allDetections?: boolean }
+): Promise<Sighting[]> {
+  const params = new URLSearchParams({ case_id: caseId });
+  if (options?.reviewStatus) params.set("review_status", options.reviewStatus);
+  if (options?.allDetections) params.set("all_detections", "true");
+  return apiRequest(`/api/v1/sightings?${params.toString()}`);
+}
+
+export function reviewSighting(
+  sightingId: string,
+  decision: "confirmed_candidate" | "not_relevant",
+  note: string = "",
+  requestKey?: string
+): Promise<{ sighting_id: string; review_status: string; reviewer_user_id: string; reviewed_at: string; idempotent?: boolean }> {
+  return apiRequest(`/api/v1/sightings/${encodeURIComponent(sightingId)}/review`, {
+    method: "POST",
+    body: JSON.stringify({
+      decision,
+      note,
+      request_key: requestKey || `rev-${sightingId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    }),
+  });
+}
+
+export function fetchSightingReviews(sightingId: string): Promise<FindingReview[]> {
+  return apiRequest(`/api/v1/sightings/${encodeURIComponent(sightingId)}/reviews`);
+}
+
+export async function fetchEvidenceFrameBlob(sightingId: string, annotated: boolean = false): Promise<Blob> {
+  const token = await getAccessToken();
+  const headers = new Headers();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const url = `${apiBase}/api/v1/sightings/${encodeURIComponent(sightingId)}/frame${annotated ? "?annotated=true" : ""}`;
+  const resp = await fetch(url, { headers, cache: "no-store" });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to load evidence frame (${resp.status})`);
+  }
+  return resp.blob();
 }

@@ -146,6 +146,8 @@ def create_jobs(state: InvestigationState) -> dict:
             "ON CONFLICT(case_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
             (state["case_id"], "queued", now),
         )
+        db.emit_case_event(conn, state["case_id"], "case_changed")
+        db.emit_case_event(conn, state["case_id"], "job_changed")
         db.audit(
             conn,
             "orchestration_planned",

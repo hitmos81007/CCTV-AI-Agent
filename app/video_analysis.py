@@ -139,7 +139,9 @@ def analyze_video(path: str | Path, recorded_at: datetime | None, confidence: fl
                 else:
                     clean_frame = frame.copy()
                     scaled_bbox = [x1, y1, x2, y2]
-                # Preserve the clean untouched raw source frame without burnt annotations for forensic integrity
+                # Preserve the unannotated captured evidence frame (resized, JPEG-encoded from original source recording)
+                # without burnt annotations, separately from dynamic annotated evidence visualizations.
+                # Note: The original source recording is preserved with its authoritative video SHA-256 hash.
                 encoded, jpeg = cv2.imencode(".jpg", clean_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                 if encoded:
                     tracks[key]["frame_jpeg"] = jpeg.tobytes()

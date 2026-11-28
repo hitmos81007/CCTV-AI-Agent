@@ -464,6 +464,18 @@ def case_lock(case_id: str) -> threading.Lock:
         return lock
 
 
+VALID_CASE_EVENT_KINDS = {"case_changed", "video_changed", "job_changed", "finding_changed", "review_changed"}
+
+
+def emit_case_event(conn: Any, case_id: str, kind: str) -> None:
+    if kind not in VALID_CASE_EVENT_KINDS:
+        raise ValueError(f"Invalid case event kind: {kind}")
+    conn.execute(
+        "INSERT INTO case_events(case_id, kind, created_at) VALUES(?, ?, ?)",
+        (case_id, kind, utc_now()),
+    )
+
+
 def lock_case_row(conn: sqlite3.Connection, case_id: str) -> None:
     if isinstance(conn, PostgresConnection):
         conn.execute("SELECT case_id FROM public.cases WHERE case_id=? FOR UPDATE", (case_id,))

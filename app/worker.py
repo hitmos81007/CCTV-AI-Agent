@@ -65,6 +65,7 @@ def reconcile_run_status(conn, case_id: str, run_id: str | None) -> str | None:
             "UPDATE investigation_states SET status=?, updated_at=? WHERE case_id=?",
             (derived, now, case_id),
         )
+        db.emit_case_event(conn, case_id, "case_changed")
         return derived
 
     if completed == total:
@@ -84,6 +85,7 @@ def reconcile_run_status(conn, case_id: str, run_id: str | None) -> str | None:
         "UPDATE investigation_states SET status=?, updated_at=? WHERE case_id=?",
         (terminal_status, now, case_id),
     )
+    db.emit_case_event(conn, case_id, "case_changed")
     if prev_status != terminal_status:
         db.audit(
             conn,
@@ -164,6 +166,7 @@ def _claim_next_job(worker_id: str) -> tuple[str, str, str | None, str, str] | N
             return None
         if row["run_id"]:
             reconcile_run_status(conn, row["case_id"], row["run_id"])
+        db.emit_case_event(conn, row["case_id"], "job_changed")
         return row["id"], row["case_id"], row["run_id"], token, row["request_json"]
 
 
@@ -204,6 +207,7 @@ def run_once(worker_id: str | None = None) -> bool:
         _analyze_zone(request, job_id=job_id, lease_token=token)
         with db.connection() as conn:
             reconcile_run_status(conn, case_id, run_id)
+            db.emit_case_event(conn, case_id, "job_changed")
         logger.info("worker %s completed job %s", resolved_worker, job_id)
     except Exception as exc:
         with db.connection() as conn:
@@ -232,6 +236,7 @@ def run_once(worker_id: str | None = None) -> bool:
                     ),
                 )
                 reconcile_run_status(conn, case_id, run_id)
+                db.emit_case_event(conn, case_id, "job_changed")
         logger.warning("worker %s failed job %s: %s", resolved_worker, job_id, type(exc).__name__)
     finally:
         done_event.set()
