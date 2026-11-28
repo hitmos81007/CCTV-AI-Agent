@@ -766,30 +766,33 @@ async def parse_clues(request: ClueParseRequest, user: AuthenticatedUser = Depen
         raise HTTPException(status_code=502, detail=f"Ollama returned HTTP {exc.response.status_code}") from exc
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail="Ollama response did not match the clue schema") from exc
-    with db.connection() as conn:
-        state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (request.case_id,)).fetchone()
-        if state and state["status"] != "draft":
-            raise HTTPException(
-                status_code=409,
-                detail="Investigation criteria cannot be modified once processing has begun",
+    with db.case_lock(request.case_id):
+        with db.connection() as conn:
+            db.lock_case_row(conn, request.case_id)
+            case = owned_case_or_404(conn, request.case_id, user.user_id)
+            state = conn.execute("SELECT status FROM investigation_states WHERE case_id=?", (request.case_id,)).fetchone()
+            if state and state["status"] != "draft":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Investigation criteria cannot be modified once processing has begun",
+                )
+            if previous_clue_json:
+                conn.execute("UPDATE sightings SET clue_json=? WHERE case_id=? AND clue_json IS NULL",
+                             (previous_clue_json, request.case_id))
+            cur = conn.execute(
+                "UPDATE cases SET description=?,clues_json=?,updated_at=? "
+                "WHERE case_id=? AND owner_id=? AND "
+                "(SELECT status FROM investigation_states WHERE case_id=cases.case_id) = 'draft'",
+                (request.description, clue.model_dump_json(), db.utc_now(), request.case_id, user.user_id),
             )
-        if previous_clue_json:
-            conn.execute("UPDATE sightings SET clue_json=? WHERE case_id=? AND clue_json IS NULL",
-                         (previous_clue_json, request.case_id))
-        cur = conn.execute(
-            "UPDATE cases SET description=?,clues_json=?,updated_at=? "
-            "WHERE case_id=? AND owner_id=? AND "
-            "(SELECT status FROM investigation_states WHERE case_id=cases.case_id) = 'draft'",
-            (request.description, clue.model_dump_json(), db.utc_now(), request.case_id, user.user_id),
-        )
-        if cur.rowcount == 0:
-            raise HTTPException(
-                status_code=409,
-                detail="Investigation criteria cannot be modified once processing has begun",
-            )
-        db.audit(conn, "case_clue_updated", {"case_id": request.case_id, "owner_id": user.user_id,
-                                               "parser": clue.parser, "clue": clue.model_dump()})
-        db.emit_case_event(conn, request.case_id, "case_changed")
+            if cur.rowcount == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Investigation criteria cannot be modified once processing has begun",
+                )
+            db.audit(conn, "case_clue_updated", {"case_id": request.case_id, "owner_id": user.user_id,
+                                                   "parser": clue.parser, "clue": clue.model_dump()})
+            db.emit_case_event(conn, request.case_id, "case_changed")
     return clue.model_dump()
 
 
@@ -1601,31 +1604,40 @@ def review_sighting(sighting_id: str, decision: ReviewDecision, user: Authentica
         )
 
     request_key = (decision.request_key or f"rev_{sighting_id}_{uuid.uuid4().hex[:12]}").strip()
+    norm_note = (decision.note or "").strip()
     with db.connection() as conn:
-        row = conn.execute(
-            "SELECT s.id, s.case_id, s.review_status FROM sightings s JOIN cases c ON c.case_id=s.case_id "
-            "WHERE s.id=? AND c.owner_id=?",
-            (sighting_id, user.user_id),
-        ).fetchone()
+        if isinstance(conn, db.PostgresConnection):
+            row = conn.execute(
+                "SELECT s.id, s.case_id, s.review_status FROM sightings s JOIN cases c ON c.case_id=s.case_id "
+                "WHERE s.id=? AND c.owner_id=? FOR UPDATE OF s",
+                (sighting_id, user.user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT s.id, s.case_id, s.review_status FROM sightings s JOIN cases c ON c.case_id=s.case_id "
+                "WHERE s.id=? AND c.owner_id=?",
+                (sighting_id, user.user_id),
+            ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Candidate not found")
 
         # Idempotency check on finding_reviews (sighting_id, request_key)
         existing = conn.execute(
-            "SELECT id, decision, note FROM finding_reviews WHERE sighting_id=? AND request_key=?",
+            "SELECT id, decision, note, created_at, reviewer_user_id FROM finding_reviews WHERE sighting_id=? AND request_key=?",
             (sighting_id, request_key),
         ).fetchone()
         if existing:
-            if existing["decision"] != norm_decision:
+            existing_note = (existing["note"] or "").strip()
+            if existing["decision"] != norm_decision or existing_note != norm_note:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Idempotency conflict: review request_key '{request_key}' was already processed with decision '{existing['decision']}'",
+                    detail=f"Idempotency conflict: review request_key '{request_key}' was already processed with different decision or notes",
                 )
             return {
                 "sighting_id": sighting_id,
                 "review_status": existing["decision"],
-                "reviewer_user_id": user.user_id,
-                "reviewed_at": now,
+                "reviewer_user_id": str(existing["reviewer_user_id"]),
+                "reviewed_at": str(existing["created_at"]),
                 "idempotent": True,
             }
 
@@ -1633,11 +1645,11 @@ def review_sighting(sighting_id: str, decision: ReviewDecision, user: Authentica
         conn.execute(
             "INSERT INTO finding_reviews(id, sighting_id, case_id, reviewer_user_id, decision, note, request_key, created_at) "
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-            (review_id, sighting_id, row["case_id"], user.user_id, norm_decision, decision.note, request_key, now),
+            (review_id, sighting_id, row["case_id"], user.user_id, norm_decision, norm_note, request_key, now),
         )
         conn.execute(
             "UPDATE sightings SET review_status=?, reviewer=?, reviewer_user_id=?, reviewed_at=?, review_note=? WHERE id=?",
-            (norm_decision, user.user_id, user.user_id, now, decision.note, sighting_id),
+            (norm_decision, user.user_id, user.user_id, now, norm_note, sighting_id),
         )
         db.audit(
             conn,

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -104,6 +104,7 @@ export function EvidenceInspectorModal({
   const [copiedHash, setCopiedHash] = useState(false);
   const [reviewNote, setReviewNote] = useState("");
   const [reviewError, setReviewError] = useState("");
+  const requestKeyRef = useRef<string | null>(null);
 
   const reviewsQuery = useQuery({
     queryKey: ["sighting-reviews", sighting.id],
@@ -111,9 +112,14 @@ export function EvidenceInspectorModal({
   });
 
   const reviewMutation = useMutation({
-    mutationFn: (decision: "confirmed_candidate" | "not_relevant") =>
-      reviewSighting(sighting.id, decision, reviewNote.trim()),
+    mutationFn: (decision: "confirmed_candidate" | "not_relevant") => {
+      if (!requestKeyRef.current) {
+        requestKeyRef.current = `rev-${sighting.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      }
+      return reviewSighting(sighting.id, decision, reviewNote.trim(), requestKeyRef.current);
+    },
     onSuccess: () => {
+      requestKeyRef.current = null;
       setReviewError("");
       void queryClient.invalidateQueries({ queryKey: ["sightings", sighting.case_id] });
       void queryClient.invalidateQueries({ queryKey: ["sighting-reviews", sighting.id] });
@@ -437,10 +443,17 @@ export function FindingsGallery({
   const sightings = sightingsQuery.data ?? [];
   const filtered = sightings.filter((s) => (filter === "all" ? true : s.review_status === filter));
 
+  const quickRequestKeysRef = useRef<Record<string, string>>({});
+
   const quickReviewMutation = useMutation({
-    mutationFn: ({ sightingId, decision }: { sightingId: string; decision: "confirmed_candidate" | "not_relevant" }) =>
-      reviewSighting(sightingId, decision),
-    onSuccess: () => {
+    mutationFn: ({ sightingId, decision }: { sightingId: string; decision: "confirmed_candidate" | "not_relevant" }) => {
+      if (!quickRequestKeysRef.current[sightingId]) {
+        quickRequestKeysRef.current[sightingId] = `rev-${sightingId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      }
+      return reviewSighting(sightingId, decision, "", quickRequestKeysRef.current[sightingId]);
+    },
+    onSuccess: (_, variables) => {
+      delete quickRequestKeysRef.current[variables.sightingId];
       void queryClient.invalidateQueries({ queryKey: ["sightings", caseId] });
       void queryClient.invalidateQueries({ queryKey: ["case-progress", caseId] });
       void queryClient.invalidateQueries({ queryKey: ["case", caseId] });

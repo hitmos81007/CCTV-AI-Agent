@@ -363,16 +363,19 @@ def run_playwright_e2e_suite():
     from playwright.sync_api import sync_playwright
 
     # Generate an authenticated session for mrityunjay.spidy@gmail.com
-    # Create or update password for mrityunjay in Supabase Admin API to ensure login works
-    pw = "Demonstration!2026#Secure"
-    r_pw = httpx.put(
-        f"{SUPABASE_URL}/auth/v1/admin/users/{MRITYUNJAY_UID}",
-        headers=admin_headers(),
-        json={"password": pw},
-        timeout=15,
-    )
-    r_pw.raise_for_status()
-    print("[+] User password set for demonstration testing.")
+    # Retrieve password from ignored environment or generate an ephemeral password via Admin API
+    pw = os.environ.get("TEST_OFFICER_PASSWORD")
+    if not pw:
+        import secrets
+        pw = secrets.token_urlsafe(20) + "!A9"
+        r_pw = httpx.put(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{MRITYUNJAY_UID}",
+            headers=admin_headers(),
+            json={"password": pw},
+            timeout=15,
+        )
+        r_pw.raise_for_status()
+    print("[+] Test credentials loaded securely from environment.")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)

@@ -122,19 +122,22 @@ export function InvestigationWorkspace({ initialCaseId = "" }: { initialCaseId?:
           table: "case_events",
           filter: `case_id=eq.${activeCaseId}`,
         },
-        (payload) => {
-          console.log("[Supabase Realtime] case_event received:", payload);
+        () => {
+          // Event received without leaking payload contents into client logs
           void queryClient.invalidateQueries({ queryKey: ["case-progress", activeCaseId] });
           void queryClient.invalidateQueries({ queryKey: ["sightings", activeCaseId] });
           void queryClient.invalidateQueries({ queryKey: ["case", activeCaseId] });
           void queryClient.invalidateQueries({ queryKey: ["cases"] });
         }
       )
-      .subscribe((status, err) => {
-        console.log(`[Supabase Realtime] status for case-events-${activeCaseId}:`, status, err);
+      .subscribe((status) => {
         if (status === "SUBSCRIBED") {
           setRealtimeState("connected");
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          // Reconcile latest state immediately upon subscription establishment or reconnection
+          void queryClient.invalidateQueries({ queryKey: ["case-progress", activeCaseId] });
+          void queryClient.invalidateQueries({ queryKey: ["sightings", activeCaseId] });
+          void queryClient.invalidateQueries({ queryKey: ["case", activeCaseId] });
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
           setRealtimeState("fallback");
         }
       });

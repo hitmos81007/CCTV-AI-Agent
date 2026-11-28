@@ -1,0 +1,41 @@
+{
+  "case_id": "CASE-0338111273",
+  "case_title": "Genuine Demonstration \u2014 Blue Commercial Transit Sighting",
+  "officer_email": "mrityunjay.spidy@gmail.com",
+  "sighting_id": "869d13cf-6a38-5487-8301-4307ced04009",
+  "vehicle_type": "bus",
+  "vehicle_color": "blue",
+  "detector_confidence": 0.9430320858955383,
+  "bounding_box": [17, 230, 809, 734],
+  "video_source_id": "1a5b8f8d-82eb-4ba8-b798-e202644237f2",
+  "source_video_sha256": "ee68d8e78628092e9747e1958f316c04ffea074e7b8da184cf81cfd1db1a4563",
+  "video_offset_seconds": 0.0,
+  "frame_sha256": "4b68e0d9b542036c64ae780b6f9f6885dfb9e54d193d9b4be16a1b9fb2b234ea",
+  "evidence_sha256": "a358c6cf5a9c04ee196b05be533c3a93e3d9f20668f4e66baad78453b054236a",
+  "storage_frame_key": "cctv-evidence/18b329ff-4651-4fb5-8d6c-9740092c3d6a/CASE-0338111273/1a5b8f8d-82eb-4ba8-b798-e202644237f2/869d13cf-6a38-5487-8301-4307ced04009/frame.jpg",
+  "human_review": {
+    "decision": "confirmed_candidate",
+    "note": "Verified genuine YOLOv11 bus detection in staged transit corridor.",
+    "reviewer_user_id": "18b329ff-4651-4fb5-8d6c-9740092c3d6a",
+    "reviewed_at": "2026-11-28T12:47:43.013657+00:00"
+  },
+  "provenance_details": {
+    "model": "YOLOv11 nano (models/yolo11n.pt)",
+    "worker_id": "agent-1",
+    "job_id": "c899581f-ade2-438d-b1ec-08b40d669133",
+    "pipeline_stages": [
+      "1. Approved officer authentication (mrityunjay.spidy@gmail.com)",
+      "2. Official investigation case creation (CASE-0338111273)",
+      "3. Authorized staged footage upload (staged_transit_bus1.mp4, SHA-256: ee68d8e786...)",
+      "4. Ollama llama3.2:latest natural-language clue parsing",
+      "5. LangGraph central multi-agent investigation orchestration",
+      "6. Autonomous GPU/CUDA worker execution (agent-1, RTX 5050 Laptop GPU)",
+      "7. Genuine YOLOv11 object detection (bus, conf: 0.9430)",
+      "8. Model-generated bounding box extraction ([17, 230, 809, 734])",
+      "9. Actual unannotated evidence frame capture and SHA-256 computation",
+      "10. Private Supabase evidence storage upload via officer-scoped key",
+      "11. Supabase WebSocket Realtime event notification",
+      "12. Officer review confirmation ('confirmed_candidate') and persistent audit trail"
+    ]
+  }
+}

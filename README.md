@@ -44,17 +44,22 @@ Choose the evaluation path that matches your available time and testing goals:
 Experience the core candidate findings gallery, evidence inspector, and human review system immediately without running a complete analysis pipeline:
 
 1. Open `http://localhost:5173/` and sign in with an approved demonstration officer account (or evaluator credentials).
-2. Navigate directly to the staged demonstration investigation:
-   - **Case Link:** `http://localhost:5173/cases/CASE-DEMO-STAGED-01`
-3. **Inspect Realtime Candidate Findings:** View candidate cards displaying the source video (`staged_traffic_cam1.mp4`), camera ID (`CAM-CENTRAL-01`), video offset timestamp (`14.5s`), detector confidence (`94.0%`), and matched clue tags (`red`, `car`, `sedan`).
-4. **Inspect Evidence & Bounding Boxes:** Click **Inspect Evidence** on any candidate card:
-   - **Annotated View:** View the canvas overlay with accurate YOLO bounding-box coordinates highlighting the detected vehicle.
+2. Navigate directly to the genuine demonstration investigation:
+   - **Case Link:** `http://localhost:5173/cases/CASE-0338111273`
+   - **Investigation Title:** `Genuine Demonstration — Blue Commercial Transit Sighting`
+   - **Provenance & AI Execution:** Genuine end-to-end YOLOv11 execution with model-generated bounding box `[17, 230, 809, 734]`, confidence `94.3%`, source video `staged_transit_bus1.mp4` (SHA-256: `ee68d8e786...`), processed by independent CUDA worker `agent-1`. See complete provenance manifest at `docs/provenance/genuine_demonstration_provenance.json`.
+3. **Inspect Realtime Candidate Findings:** View candidate cards displaying the source video (`staged_transit_bus1.mp4`), camera ID (`CAM-CENTRAL-01`), video offset timestamp (`0.0s`), detector confidence (`94.3%`), and matched clue tags (`blue`, `bus`).
+4. **Inspect Evidence & Bounding Boxes:** Click **Inspect Evidence** on the candidate card:
+   - **Annotated View:** View the canvas overlay with actual model-generated YOLOv11 bounding-box coordinates highlighting the detected blue transit vehicle.
    - **Unannotated View:** Toggle to the clean evidence frame. The backend validates the frame's cryptographic SHA-256 hash before serving to ensure uncorrupted chain-of-custody.
    - **Source Video Playback:** Click the source recording to seek directly to the sighting timestamp with HTTP 206 partial content streaming.
 5. **Submit Human Review Decision:**
    - Click **Confirm Candidate** (records `confirmed_candidate` status with the reviewer's ID and timestamp).
    - Click **Reject Candidate** (records `rejected` status with mandatory audit notes).
    - Refresh the page, log out, or restart the backend to observe full review decision persistence in PostgreSQL.
+
+> [!NOTE]
+> **Synthetic Verification Test Fixture:** The synthetic test fixture (`CASE-DEMO-STAGED-01`) is preserved strictly as an isolated UI verification benchmark and is clearly demarcated from genuine AI pipeline results.
 
 #### Method 2 — Complete End-to-End Investigation (5-10 Minutes)
 
@@ -80,8 +85,12 @@ Run the entire pipeline from officer onboarding through AI orchestration and wor
 
 | Test Fixture | Contents | Expected Result | Recommended Query |
 | :--- | :--- | :--- | :--- |
+| `staged_transit_bus1.mp4` | Staged transit corridor footage with blue commercial bus. | **Genuine AI Positive Match:** Detected by YOLOv11 nano as `bus` (`conf=0.943`, bbox `[17, 230, 809, 734]`), color classified as `blue`. Realtime candidate delivery & persistent review verified. | `"Locate suspect blue bus or commercial transit vehicle operating in central corridor."` |
+| `staged_traffic_negative.mp4` | Staged traffic corridor without target vehicle. | **Filtered / Negative Control:** Verified zero false-positive candidates emitted. Strict clue filtering demonstrated. | `"Locate a red sports car."` |
 | `staged_traffic_cam1.mp4` | Authorized traffic clip with red sedan traversing frame. | **Positive Match:** Detected by YOLOv11 as `car` with high confidence; dominant HSV color classified as `red`. | `"Suspect vehicle is a red car or sedan moving through traffic."` |
-| `staged_traffic_cam2.mp4` | Authorized traffic clip with blue bus and white delivery truck. | **Negative / Filtered:** Non-target vehicles detected by YOLOv11 but filtered out by clue classifier; zero false positive candidate findings. | `"Locate a red vehicle."` (Yields 0 candidates, demonstrating strict clue matching) |
+
+> [!IMPORTANT]
+> **Cryptographic Evidence Integrity vs. Legal Chain-of-Custody:** The SHA-256 evidence hashing implemented in this MVP cryptographically proves image and video file integrity (detecting byte corruption, tampering, or unintended format transcoding). It does NOT constitute a full statutory or forensic chain of custody under rules of evidence, which requires legal custody logging, physical evidence seal protocols, and sworn officer affirmations.
 
 > [!NOTE]
 > **Detector Limitations:** Detection accuracy depends on object visibility, resolution (minimum 32x32 pixels), and lighting. Extreme occlusions or unilluminated night scenes may reduce confidence scores.
